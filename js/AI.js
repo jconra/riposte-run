@@ -7,6 +7,17 @@
 // Each brain has a randomised PERSONALITY (aggression / defensiveness / wanderlust
 // / a preferred vehicle / reaction jitter) so no two opponents play the same, and
 // a little stochastic noise on top so they stay unpredictable.
+//
+// DATA-DRIVEN DECISION GRAPH: the tactical logic is split into three parts so it
+// can be inspected and edited as a flowchart (and round-tripped through an external
+// editor) without touching this file:
+//   * CONDITIONS — named predicates over the `view` + latched memory.
+//   * BEHAVIORS  — named steering routines that produce {fwd,turn,fire}. The trig
+//                  lives here; the graph only chooses WHICH one runs and WHEN.
+//   * DEFAULT_BRAIN — the graph itself: config knobs, latched interrupts, and an
+//                  ordered transition table. `runBrain(graph, view, mem)` walks it.
+// `Brain.think()` is now a thin wrapper around runBrain(DEFAULT_BRAIN, …); assign a
+// different graph to a brain's `.graph` to change its behavior.
 
 const TYPES = ['lurcher', 'firebrat', 'valkyrie', 'jotun'];
 const CALLSIGNS = ['Viper', 'Rook', 'Ghost', 'Talon', 'Hammer', 'Wraith', 'Jackal',
@@ -30,14 +41,247 @@ function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 function wrapPi(a) { while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) a += 2 * Math.PI; return a; }
 
+// Fraction of ammo remaining (treat "unknown" as full, matching the old behaviour).
+function ammoFrac(view) { return view.self.ammoFrac != null ? view.self.ammoFrac : 1; }
+// Pull-out HP threshold: brave brains hold longer (0.27–0.45 across aggression).
+function bailOf(p, cfg) { return cfg.bailBase - p.aggression * cfg.bailAggr; }
+
+// --- CONDITIONS ---------------------------------------------------------
+// Each returns a bool from (view, mem, p, cfg). Used both to update latches and to
+// pick the active state in the transition table.
+const CONDITIONS = {
+  always:       () => true,
+  mustGo:       (v) => !!v.mustGo,                         // still inside the gate
+  hurtLatched:  (v, m) => m._hurt,                         // pulled out to patch up
+  resupLatched: (v, m) => m._resup,                        // heading home to rearm/refuel
+  shootGoal:    (v) => !!v.shootGoal,                      // the goal is a fortification
+
+  // Aggressive brains peel off to duel a spotted rival; cautious ones only when healthy.
+  engaging: (v, m, p) => v.seesEnemy && (p.aggression > 0.35 || v.self.hpFrac > 0.4),
+  // A wall-turret is shelling us and we still have teeth → silence it first.
+  threatened: (v, m, p, cfg) => !!v.threat && ammoFrac(v) > 0 && v.self.hpFrac > bailOf(p, cfg),
+  // Chase a recent sighting, but only brave brains bother.
+  pursuing: (v, m, p) => {
+    const seenRecently = m.lastSeen && (m.t - m.lastSeen.t) < (3 + p.aggression * 5);
+    return seenRecently && p.aggression > 0.6;
+  },
+
+  // --- latch triggers ---
+  resupNeeded: (v, m, p, cfg) => ammoFrac(v) <= 0 || v.self.fuelFrac < cfg.fuelLow,
+  resupDone:   (v, m, p, cfg) => ammoFrac(v) > cfg.ammoFull && v.self.fuelFrac > cfg.fuelFull,
+  hurtNeeded:  (v, m, p, cfg) => v.self.hpFrac < bailOf(p, cfg),
+  hurtDone:    (v, m, p, cfg) => v.self.hpFrac > cfg.hurtClear,
+};
+
+// Resolve a transition's `target` key to a world point the behavior aims at.
+function resolveTarget(key, view, mem) {
+  switch (key) {
+    case 'enemy': return view.enemy;
+    case 'threat': return view.threat;
+    case 'lastSeen': return mem.lastSeen;
+    case 'resupplyOrGoal': return view.resupply || view.goal;
+    default: return view.goal;
+  }
+}
+
+// --- BEHAVIORS ----------------------------------------------------------
+// Each takes a ctx { view, mem, p, cfg, mode, target, dist, err } and returns the
+// motor command. ctx.err is the (jittered) heading error toward the target; the
+// behaviors own all the steering geometry.
+const BEHAVIORS = {
+  // Leaving the FOB: rotate IN PLACE until lined up on the gate, then drive straight
+  // out. No whisker wall-follow here (the graph marks this state skipWhiskers).
+  exit(ctx) {
+    const { err, mem, cfg } = ctx;
+    const turn = clamp(err * cfg.exitTurnGain, -1, 1);
+    const fwd = Math.abs(err) < cfg.exitAlign ? 1 : 0;
+    mem._wantMove = fwd > 0.3;
+    return { fwd, turn, fire: false, state: ctx.mode };
+  },
+
+  // Hold at effective range and shoot rather than charging the kill zone. Shared by
+  // 'engage' (mobile duel — aggressive brains press closer) and 'suppress' (keep a
+  // wall-turret at arm's length and arc around its flank to find a clean line).
+  combat(ctx) {
+    const { view, mem, p, err, dist, mode } = ctx;
+    const aimGate = 0.18 + p.aggression * 0.12;
+    const want = view.engageRange || 36;
+    const range = mode === 'suppress' ? want : want * (1 - p.aggression * 0.45);
+    const los = mode !== 'suppress' || view.threatLOS;   // duel target is always visible
+    let steer = err;
+    if (mode === 'suppress' && view.flankSide) {
+      const k = clamp((dist - range) / range, 0, 1);     // 1 far out → 0 at range
+      steer = view.threatLOS ? err + view.flankSide * 0.85 * k
+                             : err + view.flankSide * 1.5;
+    }
+    const turn = clamp(steer * 2.0, -1, 1);
+    let fwd;
+    if (!los) fwd = 0.6;                          // no clean shot → circle in to find one
+    else if (dist < range * 0.6) fwd = -0.5;      // inside the danger band → back out
+    else if (dist < range * 0.95) fwd = 0;        // hold and pour fire
+    else fwd = 1;                                  // close to range
+    let fire = false;
+    const gate = mode === 'suppress' ? aimGate + 0.05 : aimGate;
+    if (los && Math.abs(err) < gate && dist < range * 1.3) fire = mem.rng() < (0.65 + p.aggression * 0.35);
+    mem._wantMove = Math.abs(fwd) > 0.3;
+    return { fwd, turn, fire, state: mode };
+  },
+
+  // Pound a fortification from the type's reach — heavies shell it from outside the
+  // turrets' best range instead of nosing up to the wall.
+  assault(ctx) {
+    const { view, mem, p, err, dist, mode } = ctx;
+    const aimGate = 0.18 + p.aggression * 0.12;
+    const want = view.engageRange || 36;
+    const standoff = want * 0.7;
+    const turn = clamp(err * 2.0, -1, 1);
+    const fwd = dist < standoff ? 0.1 : 1;
+    let fire = false;
+    if (Math.abs(err) < aimGate + 0.06 && dist < standoff * 1.4) fire = mem.rng() < 0.75;
+    mem._wantMove = Math.abs(fwd) > 0.3;
+    return { fwd, turn, fire, state: mode };
+  },
+
+  // advance / pursue / resupply / retreat — just get to the target.
+  seek(ctx) {
+    const { view, mem, err, dist } = ctx;
+    const turn = clamp(err * 2.0, -1, 1);
+    const fwd = dist < (view.arriveDist || 8) ? 0 : 1;
+    mem._wantMove = Math.abs(fwd) > 0.3;
+    return { fwd, turn, fire: false, state: ctx.mode };
+  },
+
+  // Squeeze past a wall: commit to one turn direction and creep (or back out if boxed
+  // in on both sides). Runs for any non-exit state when the way ahead is blocked.
+  whisker(ctx) {
+    const { view, mem } = ctx;
+    if (!mem.avoidBias) mem.avoidBias = view.blockedLeft && !view.blockedRight ? 1
+                                      : view.blockedRight && !view.blockedLeft ? -1
+                                      : (mem.rng() < 0.5 ? -1 : 1);
+    const turn = mem.avoidBias;
+    const fwd = (view.blockedLeft && view.blockedRight) ? -0.6 : 0.3;
+    mem._wantMove = true;
+    return { fwd, turn, fire: false, state: ctx.mode };
+  },
+};
+
+// --- DEFAULT_BRAIN — the graph the game ships with ----------------------
+// Pure data (no functions): config knobs, latched interrupts, and an ordered
+// transition table. This reproduces the hand-written brain exactly and is what the
+// flowchart editor loads/exports. States name a BEHAVIOR + whether they skip the
+// whisker wall-follow; transitions are evaluated top-to-bottom, first match wins.
+export const DEFAULT_BRAIN = {
+  version: 1,
+  type: 'unit-brain',
+  config: {
+    stillEps: 0.05,      // movement under this (units/tick) counts as "not moving"
+    stillLimit: 1.8,     // seconds wedged before the unstick jolt fires
+    unstickDur: 0.7,     // jolt duration (seconds)
+    unstickRev: 0.7,     // reverse throttle during the jolt
+    exitAlign: 0.30,     // |heading error| under which the exit state drives straight
+    exitTurnGain: 2.2,   // steer gain while lining up on the gate
+    bailBase: 0.45,      // hp pull-out threshold = bailBase - aggression*bailAggr
+    bailAggr: 0.18,
+    hurtClear: 0.8,      // hp fraction that clears the "hurt" retreat latch
+    fuelLow: 0.18,       // fuel fraction that trips the resupply latch
+    fuelFull: 0.5,       // fuel fraction that clears it
+    ammoFull: 0.6,       // ammo fraction that clears it
+  },
+  // Latched interrupts: once tripped they hold (hysteresis) until their clear
+  // condition, and force the matching state via the transition table below.
+  latches: [
+    { flag: '_resup', trip: 'resupNeeded', clear: 'resupDone' },
+    { flag: '_hurt',  trip: 'hurtNeeded',  clear: 'hurtDone' },
+  ],
+  states: {
+    exit:     { behavior: 'exit', skipWhiskers: true },
+    retreat:  { behavior: 'seek' },
+    resupply: { behavior: 'seek' },
+    engage:   { behavior: 'combat' },
+    suppress: { behavior: 'combat' },
+    pursue:   { behavior: 'seek' },
+    assault:  { behavior: 'assault' },
+    advance:  { behavior: 'seek' },
+    unstick:  { behavior: 'unstick' },   // entered only via the anti-wedge reflex
+  },
+  // Priority ladder: clear the gate first, then self-preservation, then fighting,
+  // then the objective. `target` says what the chosen behavior aims at.
+  transitions: [
+    { when: 'mustGo',       mode: 'exit',     target: 'goal' },
+    { when: 'hurtLatched',  mode: 'retreat',  target: 'resupplyOrGoal' },
+    { when: 'resupLatched', mode: 'resupply', target: 'resupplyOrGoal' },
+    { when: 'engaging',     mode: 'engage',   target: 'enemy' },
+    { when: 'threatened',   mode: 'suppress', target: 'threat' },
+    { when: 'pursuing',     mode: 'pursue',   target: 'lastSeen' },
+    { when: 'shootGoal',    mode: 'assault',  target: 'goal' },
+    { when: 'always',       mode: 'advance',  target: 'goal' },
+  ],
+};
+
+// --- the interpreter ----------------------------------------------------
+// Walks `graph` against `view`, mutating `mem` (the per-unit latched memory =
+// the Brain instance). Reproduces the original think() order of operations exactly,
+// including the order of rng() draws, so behavior is identical to the hand-written
+// version when run with DEFAULT_BRAIN.
+export function runBrain(graph, view, mem) {
+  const cfg = graph.config, p = mem.p, self = view.self;
+  mem.t += view.dt;
+
+  // --- anti-wedge reflex ---
+  // Track motion; if the unit keeps TRYING to drive but isn't moving (jammed on a
+  // gate post / wall corner / lift lip) it racks up "still" time and jolts free with
+  // a reverse + hard pivot — the backstop that breaks any wedge a behavior can't.
+  const moved = mem._lx != null ? Math.hypot(self.x - mem._lx, self.z - mem._lz) : 1;
+  mem._lx = self.x; mem._lz = self.z;
+  if (mem._unstick > 0) {
+    mem._unstick -= view.dt;
+    return { fwd: -cfg.unstickRev, turn: mem._unstickTurn, fire: false, state: 'unstick' };
+  }
+  if (mem._wantMove && moved < cfg.stillEps) mem._stillT += view.dt; else mem._stillT = 0;
+  if (mem._stillT > cfg.stillLimit) { mem._unstick = cfg.unstickDur; mem._unstickTurn = mem.rng() < 0.5 ? -1 : 1; mem._stillT = 0; }
+
+  // Remember the last confirmed sighting (fuels the 'pursuing' condition).
+  if (view.seesEnemy && view.enemy) mem.lastSeen = { x: view.enemy.x, z: view.enemy.z, t: mem.t };
+
+  // Update latched interrupts (hysteresis).
+  for (const L of graph.latches) {
+    if (!mem[L.flag] && CONDITIONS[L.trip](view, mem, p, cfg)) mem[L.flag] = true;
+    else if (mem[L.flag] && CONDITIONS[L.clear](view, mem, p, cfg)) mem[L.flag] = false;
+  }
+
+  // Pick the active state: first transition whose condition holds.
+  let rule = graph.transitions[graph.transitions.length - 1];
+  for (const t of graph.transitions) { if (CONDITIONS[t.when](view, mem, p, cfg)) { rule = t; break; } }
+  const mode = rule.mode;
+  mem.state = mode;
+  const target = resolveTarget(rule.target, view, mem);
+
+  // Common steering bag: heading error toward the target (with personality jitter).
+  const dx = target.x - self.x, dz = target.z - self.z;
+  const dist = Math.hypot(dx, dz) || 0.0001;
+  // Vehicle front is local -Z → forward = (-sin h, -cos h), so aim = atan2(-dx,-dz).
+  const aim = Math.atan2(-dx, -dz);
+  const err = wrapPi(aim - self.heading) + (mem.rng() - 0.5) * p.jitter * 0.6;
+  const ctx = { view, mem, p, cfg, mode, target, dist, err };
+
+  const stateDef = graph.states[mode];
+  // Whisker wall-follow for any state that doesn't opt out (exit drives itself out).
+  if (!stateDef.skipWhiskers) {
+    if (view.blockedAhead) return BEHAVIORS.whisker(ctx);
+    mem.avoidBias = 0;
+  }
+  return BEHAVIORS[stateDef.behavior](ctx);
+}
+
 export class Brain {
   constructor(personality, rng = Math.random) {
     this.p = personality;
     this.rng = rng;
+    this.graph = DEFAULT_BRAIN;   // swap for a custom decision graph (e.g. from the editor)
     this.state = 'patrol';
     this.t = 0;
     this.decideT = 0;
-    this.lastSeen = null;     // { x, z, t } — last confirmed player sighting
+    this.lastSeen = null;     // { x, z, t } — last confirmed enemy sighting
     this.wp = null;           // current patrol waypoint
     this.wpUntil = 0;
     this.avoidBias = 0;       // remembered turn direction while squeezing past a wall
@@ -51,141 +295,18 @@ export class Brain {
   }
 
   // Tactical layer: drive toward the commander's strategic GOAL, but break off to
-  // fight the player if it's actually seen (fog of war). The commander (main.js)
-  // decides the goal + whether to shoot it; this just executes with personality.
+  // fight a rival that's actually seen (fog of war). The commander (main.js) decides
+  // the goal + whether to shoot it; this executes it with personality + reflexes.
   //
   // view: {
-  //   dt, self:{x,z,heading,hpFrac,fuelFrac},
-  //   seesEnemy:bool, enemy:{x,z}|null,        // nearest VISIBLE rival unit (any team)
-  //   goal:{x,z}, shootGoal:bool, arriveDist:number,
+  //   dt, self:{x,z,heading,hpFrac,fuelFrac,ammoFrac},
+  //   seesEnemy:bool, enemy:{x,z}|null, threat:{x,z}|null, threatLOS:bool, flankSide:±1,
+  //   goal:{x,z}, resupply:{x,z}|null, shootGoal:bool, mustGo:bool,
+  //   arriveDist:number, engageRange:number,
   //   blockedAhead:bool, blockedLeft:bool, blockedRight:bool
   // }
   // returns { fwd:-1..1, turn:-1..1, fire:bool, state }
   think(view) {
-    const p = this.p, self = view.self;
-    this.t += view.dt;
-
-    // --- anti-wedge -------------------------------------------------------
-    // If the unit keeps trying to drive but isn't actually moving (jammed on the
-    // elevator lip, a gate post, a wall corner), it racks up "still" time and then
-    // jolts free with a reverse + hard pivot. This is what breaks the "dancing on
-    // the elevator" lock — wall-following alone can loop forever in a tight spot.
-    const moved = this._lx != null ? Math.hypot(self.x - this._lx, self.z - this._lz) : 1;
-    this._lx = self.x; this._lz = self.z;
-    if (this._unstick > 0) {
-      this._unstick -= view.dt;
-      return { fwd: -0.7, turn: this._unstickTurn, fire: false, state: 'unstick' };
-    }
-    if (this._wantMove && moved < 0.05) this._stillT += view.dt; else this._stillT = 0;
-    if (this._stillT > 1.8) { this._unstick = 0.7; this._unstickTurn = this.rng() < 0.5 ? -1 : 1; this._stillT = 0; }
-
-    if (view.seesEnemy && view.enemy) this.lastSeen = { x: view.enemy.x, z: view.enemy.z, t: this.t };
-    const seenRecently = this.lastSeen && (this.t - this.lastSeen.t) < (3 + p.aggression * 5);
-    // Aggressive brains peel off to duel a spotted rival; cautious ones stick to
-    // the objective unless directly threatened.
-    const engaging = view.seesEnemy && (p.aggression > 0.35 || self.hpFrac > 0.4);
-
-    // Out of ammo (or nearly dry on fuel) → break off and go home to resupply
-    // instead of uselessly chasing. Latched with hysteresis so it tops up before
-    // returning to the fight rather than yo-yoing at the first round.
-    const ammoF = self.ammoFrac != null ? self.ammoFrac : 1;
-    if (!this._resup && (ammoF <= 0 || self.fuelFrac < 0.18)) this._resup = true;
-    else if (this._resup && ammoF > 0.6 && self.fuelFrac > 0.5) this._resup = false;
-
-    // Self-preservation: when chewed down, break off and fall back to base to patch
-    // up instead of feeding itself to the defences. Latched with hysteresis (a brave
-    // brain holds a little longer) so it doesn't yo-yo at the threshold, and it
-    // repairs to a healthy margin before committing again.
-    const bail = 0.45 - p.aggression * 0.18;       // 0.27–0.45: pull out EARLY, not at death's door
-    if (!this._hurt && self.hpFrac < bail) this._hurt = true;
-    else if (this._hurt && self.hpFrac > 0.8) this._hurt = false;
-
-    // A wall-turret is shelling us and we still have teeth → silence it before pushing
-    // the fort. Cautious brains suppress sooner; brave ones tolerate more incoming.
-    const threatened = view.threat && ammoF > 0 && self.hpFrac > bail;
-
-    let target, mode;
-    if (view.mustGo) { target = view.goal; mode = 'exit'; }   // clear the gate before anything else
-    else if (this._hurt) { target = view.resupply || view.goal; mode = 'retreat'; }   // fall back, minimize exposure
-    else if (this._resup) { target = view.resupply || view.goal; mode = 'resupply'; }
-    else if (engaging) { target = view.enemy; mode = 'engage'; }
-    else if (threatened) { target = view.threat; mode = 'suppress'; }   // kill the tower that's hurting us
-    else if (seenRecently && p.aggression > 0.6) { target = this.lastSeen; mode = 'pursue'; }
-    else { target = view.goal; mode = view.shootGoal ? 'assault' : 'advance'; }
-    this.state = mode;
-
-    const dx = target.x - self.x, dz = target.z - self.z;
-    const dist = Math.hypot(dx, dz) || 0.0001;
-    // Vehicle front is local -Z → forward = (-sin h, -cos h), so aim = atan2(-dx,-dz).
-    const aim = Math.atan2(-dx, -dz);
-    let err = wrapPi(aim - self.heading) + (this.rng() - 0.5) * p.jitter * 0.6;
-    let turn = clamp(err * 2.0, -1, 1);
-    let fwd = 1;
-    let fire = false;
-
-    // --- leaving the FOB: face the gate, THEN drive out --------------------
-    // A unit that tops the lift off-angle (or whose exit gate changed on detach)
-    // pivots IN PLACE until it's lined up on the exit waypoint, then drives
-    // straight through. The old behaviour crept forward while turning, arcing it
-    // into the shaft/gate wall — and because it kept inching, the anti-wedge jolt
-    // never tripped (the "stuck on the elevator" dance). No whisker wall-follow
-    // here; if it's truly nose-on a wall the anti-wedge above is the backstop.
-    if (mode === 'exit') {
-      turn = clamp(err * 2.2, -1, 1);
-      fwd = Math.abs(err) < 0.30 ? 1 : 0;   // aligned → straight out; else turn in place
-      this._wantMove = fwd > 0.3;
-      return { fwd, turn, fire: false, state: mode };
-    }
-
-    // --- obstacle avoidance (whiskers) -------------------------------------
-    if (view.blockedAhead) {
-      if (!this.avoidBias) this.avoidBias = view.blockedLeft && !view.blockedRight ? 1
-                                          : view.blockedRight && !view.blockedLeft ? -1
-                                          : (this.rng() < 0.5 ? -1 : 1);
-      turn = this.avoidBias;
-      fwd = (view.blockedLeft && view.blockedRight) ? -0.6 : 0.3;
-      this._wantMove = true;
-      return { fwd, turn, fire, state: mode };
-    }
-    this.avoidBias = 0;
-
-    const aimGate = 0.18 + p.aggression * 0.12;
-    const want = view.engageRange || 36;        // this type's preferred stand-off
-    if (mode === 'engage' || mode === 'suppress') {
-      // Hold at effective range and shoot rather than charging the kill zone. A
-      // suppressing unit keeps the turret at arm's length (full stand-off); a mobile
-      // duel lets aggressive brains press in closer.
-      const range = mode === 'suppress' ? want : want * (1 - p.aggression * 0.45);
-      const los = mode !== 'suppress' || view.threatLOS;   // duel target is always visible
-      // Flank approach: arc around the tower's side instead of driving dead at it
-      // through the wall-gap crossfire. With a clean shot the bias fades to zero as
-      // we reach range (heading settles onto the tower to fire); with NO shot yet we
-      // swing hard and keep circling the perimeter until a line opens up — that's the
-      // "go around the side and hit the corner from the flank" move.
-      let steer = err;
-      if (mode === 'suppress' && view.flankSide) {
-        const k = clamp((dist - range) / range, 0, 1);     // 1 far out → 0 at range
-        steer = view.threatLOS ? err + view.flankSide * 0.85 * k
-                               : err + view.flankSide * 1.5;
-      }
-      turn = clamp(steer * 2.0, -1, 1);
-      if (!los) fwd = 0.6;                          // no clean shot → circle in to find one
-      else if (dist < range * 0.6) fwd = -0.5;      // inside the danger band → back out
-      else if (dist < range * 0.95) fwd = 0;        // hold and pour fire
-      else fwd = 1;                                  // close to range
-      const gate = mode === 'suppress' ? aimGate + 0.05 : aimGate;
-      if (los && Math.abs(err) < gate && dist < range * 1.3) fire = this.rng() < (0.65 + p.aggression * 0.35);
-    } else if (mode === 'assault') {
-      // Pound the fortification, but from the type's reach — heavies shell it from
-      // outside the turrets' best range instead of nosing up to the wall.
-      const standoff = want * 0.7;
-      if (dist < standoff) fwd = 0.1; else fwd = 1;
-      if (Math.abs(err) < aimGate + 0.06 && dist < standoff * 1.4) fire = this.rng() < 0.75;
-    } else { // advance / pursue / resupply / retreat — just get there
-      fwd = (dist < (view.arriveDist || 8)) ? 0 : 1;
-    }
-
-    this._wantMove = Math.abs(fwd) > 0.3;
-    return { fwd, turn, fire, state: mode };
+    return runBrain(this.graph || DEFAULT_BRAIN, view, this);
   }
 }
