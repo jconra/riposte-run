@@ -144,18 +144,39 @@ const BEHAVIORS = {
     // good shot). Otherwise drive to the radial standoff — outside the base through
     // the turret, away from the other towers' arcs — which also squares us onto it.
     if (mode === 'suppress' && view.threatStand) {
-      const canHit = view.threatLOS && Math.abs(err) < (aimGate + 0.08);
-      if (canHit) {
-        const turn = clamp(err * 2.2, -1, 1);
-        const fwd = dist > want ? 0.5 : 0;                  // edge closer only if out of reach
-        const fire = dist < want * 1.2 ? mem.rng() < (0.7 + p.aggression * 0.3) * AI_HANDICAP.fireProb : false;
+      // SIEGE DOCTRINE: silence the towers ONE AT A TIME from the radial standoff —
+      // the spot OUTSIDE the base, through the target turret, where only THAT gun can
+      // hit back. The old code planted and fired the instant its NOSE lined up on a
+      // tower, so a Valkyrie sat out front hammering one gun while every OTHER tower
+      // chewed it. The fix turns on two facts: (1) the turret has an ARC (Valkyrie
+      // 90°, Lurcher 360°), so the weapon can keep BEARING on the tower while the hull
+      // points elsewhere; (2) so we can steer the hull toward the standoff to SKIRT
+      // around the base AND fire the whole way. err here is the hull→tower angle.
+      const dsx = view.threatStand.x - self.x, dsz = view.threatStand.z - self.z;
+      const dStand = Math.hypot(dsx, dsz);
+      const atStand = dStand < 9;                          // arrived at the one-gun spot
+      // Fire whenever the turret can bear on the tower (target inside the arc) and it's
+      // in range with a clear line — independent of where the hull is pointed.
+      const arc = Math.min(view.shotArc || 0.26, Math.PI * 0.55);
+      const canBear = view.threatLOS && Math.abs(err) < arc && dist < want * 1.3;
+      const fire = canBear ? mem.rng() < (0.7 + p.aggression * 0.3) * AI_HANDICAP.fireProb : false;
+      // A ground unit can be physically barred from the standoff (water / coast / a
+      // wall it must blow through first). If it's wedged on the way, stop trying to
+      // skirt — square up and pour fire into whatever it can see (this fallback is
+      // what the earlier "march to the standoff cold" attempt lacked).
+      const barred = !view.flyer && mem._stillT > 0.5;
+      if (atStand || barred) {
+        const turn = clamp(err * 2.2, -1, 1);              // square the nose onto the tower
+        const fwd = dist > want ? 0.4 : 0;                 // ease into range, then plant
         mem._wantMove = fwd > 0.3;
         return { fwd, turn, fire, state: mode };
       }
-      const dsx = view.threatStand.x - self.x, dsz = view.threatStand.z - self.z;   // no clean shot → reposition
+      // Skirt: drive the hull toward the standoff (arcing around the base) while the
+      // turret keeps firing on the tower whenever it bears. The point is to REACH the
+      // flank, not dance out front.
       const eMove = wrapPi(Math.atan2(-dsx, -dsz) - self.heading);
       mem._wantMove = true;
-      return { fwd: 1, turn: clamp(eMove * 2.0, -1, 1), fire: false, state: mode };
+      return { fwd: 1, turn: clamp(eMove * 2.0, -1, 1), fire, state: mode };
     }
     const los = mode !== 'suppress' || view.threatLOS;   // duel target is always visible
     let steer = err;

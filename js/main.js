@@ -16,7 +16,7 @@ import { Garage } from './Garage.js';
 import { TEAM_COLORS, updateCamo, camoParams } from '../../vehicle-designer/js/CamoTexture.js';
 import { SoundManager } from '../../vehicle-designer/js/SoundManager.js';
 import { Projectiles } from '../../vehicle-designer/js/Projectiles.js';
-import { Brain, randomPersonality } from './AI.js?v=51';
+import { Brain, randomPersonality } from './AI.js?v=52';
 import { drawStrategy, COUNTER } from './AIStrategies.js?v=50';
 import { astarGrid } from './astar.js';
 import { makeFuelTank, makeAmmoDepot, makeShieldGenerator, makeShieldBubble, RESUPPLY_TINT } from './Resupply.js';
@@ -2002,16 +2002,24 @@ class AICommander {
     }
     const goal = this.strategy.objective(this);
     // Where to rearm/refuel: the NEAREST valid source for what we need — own base
-    // (always known) OR a DISCOVERED neutral fuel/ammo supply point. Out of ammo is
-    // the priority (head for ammo); otherwise top up the low tank.
+    // (always restocks fuel + ammo) OR a DISCOVERED neutral depot. A neutral depot
+    // gives just ONE resource, but the brain only clears the resupply latch when BOTH
+    // fuel AND ammo are back up (DEFAULT_BRAIN.config fuelFull 0.5 / ammoFull 0.6). So
+    // a unit that's low on BOTH must go to its base — otherwise it tops off the one
+    // thing the depot offers, the latch stays stuck on the other, and it camps the
+    // tank forever (the "Jotun parked at a fuel supply" bug). Only divert to a single-
+    // resource depot when that resource is the ONLY one still under its restock line.
     const fob = teamCamp(this.team, 'fob'), home = teamCamp(this.team, 'main');
-    const needAmmo = v.ammo <= 0;
-    const wantKind = needAmmo ? 'ammo' : 'fuel';
+    const lowAmmo = v.ammo < v.maxAmmo * 0.6;       // matches config.ammoFull (latch clear)
+    const lowFuel = v.fuel < v.maxFuel * 0.5;       // matches config.fuelFull (latch clear)
     let supply = null, bestD = Infinity;
     const consider = (x, z) => { const d = (px - x) ** 2 + (pz - z) ** 2; if (d < bestD) { bestD = d; supply = { center: { x, z } }; } };
     if (fob) consider(fob.center.x, fob.center.z);
     if (home) consider(home.center.x, home.center.z);
-    for (const rp of resupplies) if (!rp.dead && rp.kind === wantKind && this.knownSupplies.has(rp)) consider(rp.pos.x, rp.pos.z);
+    // A neutral depot is only worth the detour if topping its one resource fully clears
+    // the latch — i.e. it's the single low resource. Both low → base only (above).
+    const depotKind = (lowAmmo && !lowFuel) ? 'ammo' : (lowFuel && !lowAmmo) ? 'fuel' : null;
+    if (depotKind) for (const rp of resupplies) if (!rp.dead && rp.kind === depotKind && this.knownSupplies.has(rp)) consider(rp.pos.x, rp.pos.z);
     this._supply = supply ? { x: supply.center.x, z: supply.center.z } : null;   // nav target while resupplying
     // HEAL home: HP only regenerates at an OWN base (a neutral fuel/ammo depot can't
     // patch the hull) — so a hurt unit must fall back HERE, not to the nearest depot,
@@ -2072,7 +2080,7 @@ class AICommander {
     return {
       dt,
       self: { x: px, z: pz, heading: h, type: v.type, shield: v.shield, hpFrac: v.hp / v.maxHp, fuelFrac: v.fuel / v.maxFuel, ammoFrac: v.ammo / v.maxAmmo },
-      seesEnemy, enemy,
+      seesEnemy, enemy, flyer, shotArc: SHOT_ARC[v.type] ?? Math.PI / 5,
       threat, threatLOS, flankSide, threatStand, engageRange: ENGAGE_RANGE[v.type] || 36,
       goal: mustGo ? this._exit : goal,
       mustGo,
