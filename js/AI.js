@@ -194,9 +194,15 @@ const BEHAVIORS = {
 
   // advance / pursue / resupply / retreat — just get to the target.
   seek(ctx) {
-    const { view, mem, err, dist } = ctx;
+    const { view, mem, err, dist, mode } = ctx;
+    // Heading HOME to heal/rearm must actually REACH the base (its heal radius is
+    // ~12u), so use a tight arrival here — NOT the card's objective standoff, which
+    // can be large (e.g. ScoutSnatch parks 30u out to scout) and would otherwise
+    // leave a wounded unit frozen just outside its own supply, never healing.
+    const homeward = mode === 'retreat' || mode === 'resupply';
+    const arrive = homeward ? 5 : (view.arriveDist || 8);
     const turn = clamp(err * 2.0, -1, 1);
-    const fwd = dist < (view.arriveDist || 8) ? 0 : 1;
+    const fwd = dist < arrive ? 0 : 1;
     mem._wantMove = Math.abs(fwd) > 0.3;
     return { fwd, turn, fire: false, state: ctx.mode };
   },
