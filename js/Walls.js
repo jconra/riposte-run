@@ -58,10 +58,11 @@ export class Wall {
     manager.add(this.body);
 
     if (this.turret) {
-      manager.add(new Destructible(this.turret.head, {
+      this.turretDest = new Destructible(this.turret.head, {
         type: 'gun', hp: 120,
-        onDestroyed: () => { this.turret.dead = true; this._fall(this.turret); },
-      }));
+        onDestroyed: () => this._killTurret(),
+      });
+      manager.add(this.turretDest);
     }
   }
 
@@ -184,19 +185,34 @@ export class Wall {
     return { group, head, dead: false, falling: false, vel: new THREE.Vector3(), ang: new THREE.Vector3(), sweep: Math.random() * 6.28 };
   }
 
-  // Damage crossed a stage threshold -> shed the appropriate number of top layers.
+  // Damage crossed a stage threshold -> shed from the TOP down. The corner gun rides
+  // highest, so it's the first thing to topple; then the parapet and stone layers peel
+  // off top-to-bottom. (Sequence: gun, top layer, … , bottom layer.)
   _restage() {
     const frac = Math.max(0, this.body.hp / this.maxHp);
-    const lost = Math.floor((1 - frac) * this.layers.length);
-    for (let i = this.layers.length - 1; i >= 0; i--) {
-      const fromTop = this.layers.length - 1 - i;
-      if (fromTop < lost && !this.layers[i].falling) this._fall(this.layers[i]);
+    const denom = this.layers.length + (this.turret ? 1 : 0);
+    const lost = Math.floor((1 - frac) * denom);
+    let k = 0;
+    if (this.turret) { if (k < lost) this._killTurret(); k++; }   // gun goes first
+    for (let i = this.layers.length - 1; i >= 0; i--, k++) {
+      if (k < lost && !this.layers[i].falling) this._fall(this.layers[i]);
     }
+  }
+
+  // Topple the corner gun off the tower (whether knocked loose by body damage or shot
+  // out directly). Re-attach the head if the Destructible detached it, so the whole gun
+  // tumbles instead of just vanishing.
+  _killTurret() {
+    if (!this.turret || this.turret.dead) return;
+    this.turret.dead = true;
+    if (this.turretDest && !this.turretDest.dead) this.turretDest.damage(1e9);
+    if (this.turret.head && this.turret.head.parent !== this.turret.group) this.turret.group.add(this.turret.head);
+    if (!this.turret.falling) this._fall(this.turret);
   }
 
   _collapseAll() {
     for (const L of this.layers) if (!L.falling) this._fall(L);
-    if (this.turret && !this.turret.falling) this._fall(this.turret);
+    this._killTurret();
   }
 
   // Kick a layer/turret loose: outward + up, with tumble.

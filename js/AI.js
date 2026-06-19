@@ -19,9 +19,18 @@
 // `Brain.think()` is now a thin wrapper around runBrain(DEFAULT_BRAIN, …); assign a
 // different graph to a brain's `.graph` to change its behavior.
 
+import { COUNTER } from './AIStrategies.js';   // rock-paper-scissors web for fight-or-flight matchups
+
 const TYPES = ['lurcher', 'firebrat', 'valkyrie', 'jotun'];
 const CALLSIGNS = ['Viper', 'Rook', 'Ghost', 'Talon', 'Hammer', 'Wraith', 'Jackal',
                    'Cinder', 'Bolt', 'Reaver', 'Specter', 'Mauler', 'Onyx', 'Karn'];
+
+// AI combat handicap — the single knob for "how hard does the AI hit". A human on a
+// touchscreen can't out-aim a perfect bot, so the opponents are deliberately reined in:
+//   aimSpread > 1 sprays their shots wider (more clean misses)
+//   fireProb  < 1 makes them shoot less often (longer gaps to react / flee)
+// Set both to 1.0 for the old, ruthless behavior. Tune to taste.
+const AI_HANDICAP = { aimSpread: 1.7, fireProb: 0.7 };
 
 export function randomPersonality(rng = Math.random) {
   // Bias toward a "lead trait" so personalities feel distinct, not all-average.
@@ -46,6 +55,27 @@ function ammoFrac(view) { return view.self.ammoFrac != null ? view.self.ammoFrac
 // Pull-out HP threshold: brave brains hold longer (0.27–0.45 across aggression).
 function bailOf(p, cfg) { return cfg.bailBase - p.aggression * cfg.bailAggr; }
 
+// FIGHT-OR-FLIGHT WEIGHT — should this unit pick a fight with the rival it sees, or
+// keep moving and avoid it? A signed score: > 0 = fight, <= 0 = don't engage (carry on
+// the mission / let the hurt-latch pull it out if it's taking fire). Built from the
+// factors Jacob sketched (hp, ammo, shield, fragility, personality) plus the counter web.
+function fightScore(v, p) {
+  const s = v.self;
+  let w = (s.hpFrac - 0.45) * 3;                                  // healthy → fight, low → flee
+  w += s.ammoFrac > 0.5 ? 1 : (s.ammoFrac <= 0 ? -4 : -0.5);      // dry guns can't win
+  if (s.shield > 0) w += 1;                                       // we have armour to spend
+  w += (p.aggression - 0.45) * 2;                                 // brave brains press
+  w -= (p.defensiveness - 0.4) * 1.2;                             // cautious brains hold back
+  if (s.type === 'firebrat') w -= 1.2;                            // fragile — dies in a hit or two
+  if (v.enemy) {
+    if (v.enemy.shield > 0) w -= 1;                               // they're harder to crack
+    const et = v.enemy.type;
+    if (et && COUNTER[et] === s.type) w += 1.6;                   // we counter them → press
+    if (et && COUNTER[s.type] === et) w -= 1.8;                   // they counter us → avoid
+  }
+  return w;
+}
+
 // --- CONDITIONS ---------------------------------------------------------
 // Each returns a bool from (view, mem, p, cfg). Used both to update latches and to
 // pick the active state in the transition table.
@@ -56,8 +86,9 @@ const CONDITIONS = {
   resupLatched: (v, m) => m._resup,                        // heading home to rearm/refuel
   shootGoal:    (v) => !!v.shootGoal,                      // the goal is a fortification
 
-  // Aggressive brains peel off to duel a spotted rival; cautious ones only when healthy.
-  engaging: (v, m, p) => v.seesEnemy && (p.aggression > 0.35 || v.self.hpFrac > 0.4),
+  // Fight-or-flight: only duel a spotted rival when the weighted odds favour it (good
+  // hp/ammo/matchup), otherwise keep moving instead of trading into a loss.
+  engaging: (v, m, p) => v.seesEnemy && fightScore(v, p) > 0,
   // A wall-turret is shelling us and we still have teeth → silence it first.
   threatened: (v, m, p, cfg) => !!v.threat && ammoFrac(v) > 0 && v.self.hpFrac > bailOf(p, cfg),
   // Chase a recent sighting, but only brave brains bother.
@@ -79,6 +110,7 @@ function resolveTarget(key, view, mem) {
     case 'enemy': return view.enemy;
     case 'threat': return view.threat;
     case 'lastSeen': return mem.lastSeen;
+    case 'home': return view.home || view.resupply || view.goal;   // where HP actually heals (own base)
     case 'resupplyOrGoal': return view.resupply || view.goal;
     default: return view.goal;
   }
@@ -122,7 +154,7 @@ const BEHAVIORS = {
     else fwd = 1;                                  // close to range
     let fire = false;
     const gate = mode === 'suppress' ? aimGate + 0.05 : aimGate;
-    if (los && Math.abs(err) < gate && dist < range * 1.3) fire = mem.rng() < (0.65 + p.aggression * 0.35);
+    if (los && Math.abs(err) < gate && dist < range * 1.3) fire = mem.rng() < (0.65 + p.aggression * 0.35) * AI_HANDICAP.fireProb;
     mem._wantMove = Math.abs(fwd) > 0.3;
     return { fwd, turn, fire, state: mode };
   },
@@ -137,7 +169,7 @@ const BEHAVIORS = {
     const turn = clamp(err * 2.0, -1, 1);
     const fwd = dist < standoff ? 0.1 : 1;
     let fire = false;
-    if (Math.abs(err) < aimGate + 0.06 && dist < standoff * 1.4) fire = mem.rng() < 0.75;
+    if (Math.abs(err) < aimGate + 0.06 && dist < standoff * 1.4) fire = mem.rng() < 0.75 * AI_HANDICAP.fireProb;
     mem._wantMove = Math.abs(fwd) > 0.3;
     return { fwd, turn, fire, state: mode };
   },
@@ -208,7 +240,7 @@ export const DEFAULT_BRAIN = {
   // then the objective. `target` says what the chosen behavior aims at.
   transitions: [
     { when: 'mustGo',       mode: 'exit',     target: 'goal' },
-    { when: 'hurtLatched',  mode: 'retreat',  target: 'resupplyOrGoal' },
+    { when: 'hurtLatched',  mode: 'retreat',  target: 'home' },
     { when: 'resupLatched', mode: 'resupply', target: 'resupplyOrGoal' },
     { when: 'engaging',     mode: 'engage',   target: 'enemy' },
     { when: 'threatened',   mode: 'suppress', target: 'threat' },
@@ -261,7 +293,7 @@ export function runBrain(graph, view, mem) {
   const dist = Math.hypot(dx, dz) || 0.0001;
   // Vehicle front is local -Z → forward = (-sin h, -cos h), so aim = atan2(-dx,-dz).
   const aim = Math.atan2(-dx, -dz);
-  const err = wrapPi(aim - self.heading) + (mem.rng() - 0.5) * p.jitter * 0.6;
+  const err = wrapPi(aim - self.heading) + (mem.rng() - 0.5) * p.jitter * 0.6 * AI_HANDICAP.aimSpread;
   const ctx = { view, mem, p, cfg, mode, target, dist, err };
 
   const stateDef = graph.states[mode];

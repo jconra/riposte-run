@@ -18,6 +18,7 @@ import { SoundManager } from '../../vehicle-designer/js/SoundManager.js';
 import { Projectiles } from '../../vehicle-designer/js/Projectiles.js';
 import { Brain, randomPersonality } from './AI.js';
 import { drawStrategy, COUNTER } from './AIStrategies.js';
+import { astarGrid } from './astar.js';
 import { makeFuelTank, makeAmmoDepot, makeShieldGenerator, makeShieldBubble, RESUPPLY_TINT } from './Resupply.js';
 
 // --- Renderer ----------------------------------------------------------
@@ -72,6 +73,11 @@ const orbit = { target: new THREE.Vector3(0, 0, 0), dist: 150, yaw: 0, pitch: 1.
 let zoomMax = 420;
 // Single-finger virtual joystick: pan toward the finger's offset from screen centre.
 const touchPan = { active: false, x: 0, y: 0, sx: 0, sy: 0, t: 0 };
+// Touch driving: hold a finger on the field and the vehicle heads toward that point
+// (point-to-steer, set in the canvas touch handlers, consumed by driveInput). A quick
+// tap fires instead of steering. null = no finger steering this frame.
+let touchSteer = null;            // { x, y } screen point the vehicle should drive toward
+const TOUCH_STOP_R = 7;           // world radius around the vehicle that reads as "stop"
 
 function updateCamera() {
   const cp = Math.max(0.15, Math.min(1.45, orbit.pitch));
@@ -110,39 +116,65 @@ function updateCamera() {
     orbit.dist = Math.max(8, Math.min(zoomMax, orbit.dist + e.deltaY * 0.12));
     updateCamera();
   }, { passive: true });
-  // Touch: one finger = drive joystick (pan toward finger), two fingers = pinch zoom.
+  // Touch model:
+  //   DRIVING — the FIRST finger steers (the vehicle heads toward it); release it as a
+  //     quick tap and it fires instead. Any EXTRA finger is a tap-to-fire, so you can
+  //     shoot without lifting the steering thumb. (No pinch-zoom while driving.)
+  //   SPECTATING — one finger pans the camera, two fingers pinch-zoom.
   let pinchD = 0;
+  let steerId = null, steerStart = null;   // the steering finger's id + its down pos/time
+  const taps = {};                         // extra fingers being watched for a tap (by identifier)
+  const humanDriving = () => onField && player && !player.dead;
+  const fireAt = (x, y) => { if (playerIsValkyrie()) acquireLock(x, y); else fireAtPoint(x, y); };
+  const isTap = s => Math.hypot(s.x - s.sx, s.y - s.sy) < 12 && performance.now() - s.t < 300;
+
   el.addEventListener('touchstart', e => {
+    if (humanDriving()) {
+      for (const t of e.changedTouches) {
+        const s = { sx: t.clientX, sy: t.clientY, x: t.clientX, y: t.clientY, t: performance.now() };
+        if (steerId === null) { steerId = t.identifier; steerStart = s; touchSteer = { x: t.clientX, y: t.clientY }; }
+        else taps[t.identifier] = s;
+      }
+      return;
+    }
     if (e.touches.length === 1) {
       const t = e.touches[0];
-      touchPan.active = true;
-      touchPan.x = touchPan.sx = t.clientX;
-      touchPan.y = touchPan.sy = t.clientY;
+      touchPan.active = true; touchPan.x = touchPan.sx = t.clientX; touchPan.y = touchPan.sy = t.clientY;
       touchPan.t = performance.now();
-    } else if (e.touches.length === 2) {
-      touchPan.active = false;
-      pinchD = touchDist(e);
-    }
+    } else if (e.touches.length === 2) { touchPan.active = false; pinchD = touchDist(e); }
   }, { passive: true });
+
   el.addEventListener('touchmove', e => {
+    if (steerId !== null || Object.keys(taps).length) {
+      for (const t of e.changedTouches) {
+        if (t.identifier === steerId) { touchSteer.x = steerStart.x = t.clientX; touchSteer.y = steerStart.y = t.clientY; }
+        else if (taps[t.identifier]) { taps[t.identifier].x = t.clientX; taps[t.identifier].y = t.clientY; }
+      }
+      return;
+    }
     if (e.touches.length === 1 && touchPan.active) {
-      touchPan.x = e.touches[0].clientX;
-      touchPan.y = e.touches[0].clientY;
+      touchPan.x = e.touches[0].clientX; touchPan.y = e.touches[0].clientY;
     } else if (e.touches.length === 2) {
       const d = touchDist(e);
       orbit.dist = Math.max(8, Math.min(zoomMax, orbit.dist + (pinchD - d) * 0.5));
-      pinchD = d;
-      updateCamera();
+      pinchD = d; updateCamera();
     }
   }, { passive: true });
-  el.addEventListener('touchend', () => {
-    if (touchPan.active) {
-      const moved = Math.hypot(touchPan.x - touchPan.sx, touchPan.y - touchPan.sy);
-      const tap = moved < 8 && performance.now() - touchPan.t < 300;
-      if (tap && onField && player && !player.dead) { if (playerIsValkyrie()) acquireLock(touchPan.x, touchPan.y); else fireAtPoint(touchPan.x, touchPan.y); }
-      else if (tap && QS.has('tap')) damageTapAt(touchPan.x, touchPan.y);
+
+  el.addEventListener('touchend', e => {
+    for (const t of e.changedTouches) {
+      if (t.identifier === steerId) {
+        if (isTap(steerStart) && onField && player && !player.dead) fireAt(steerStart.x, steerStart.y);   // a flick of the steer finger = a shot
+        steerId = null; steerStart = null; touchSteer = null;
+      } else if (taps[t.identifier]) {
+        const s = taps[t.identifier]; delete taps[t.identifier];
+        if (isTap(s) && onField && player && !player.dead) fireAt(s.x, s.y);
+      }
     }
-    touchPan.active = false;
+    if (!humanDriving() && touchPan.active && e.touches.length === 0) {
+      if (isTap(touchPan) && QS.has('tap')) damageTapAt(touchPan.x, touchPan.y);
+      touchPan.active = false;
+    }
   });
   function touchDist(e) {
     const dx = e.touches[0].clientX - e.touches[1].clientX;
@@ -383,6 +415,9 @@ let flagsCaptured = 0;  // enemy flags the player has extracted into the garage 
 let deploy = null;    // { type, colorIndex } captured when a deploy is confirmed
 let fieldFadeT = 0;   // counts up after handoff to fade the black deploy overlay out
 let garageFadeT = null; // when set, fades the garage in from black (on return)
+let victoryReturn = false; // the current lift descent is a winning flag extraction (run the cinematic)
+let victoryHoldT = 0;      // beat held at the bottom of a victory descent before fading out
+const VICT_HOLD = 1.9;     // seconds to linger on the celebration at the bottom
 
 // Team accent colours (match Camp's wall accents) + camo palette slot per team
 // (indices into TEAM_COLORS: 4 = RED, 5 = BLUE).
@@ -509,7 +544,17 @@ foliage.build();
 function scatterFoliage() {
   if (!foliage.props) return;
   const sites = camps.map(c => ({ x: c.center.x, z: c.center.z }));
-  foliage.scatter(map, sites, { density: 1 });
+  // Keep trees off the roads (and one cell either side) so units aren't blocked on
+  // their own lanes — the A* navigator treats roads as the cheap path.
+  const c = grid.cell;
+  const onRoad = (x, z) => {
+    if (!roadNet.cells) return false;
+    const ci = Math.round(x / c), cj = Math.round(z / c);
+    for (let di = -1; di <= 1; di++) for (let dj = -1; dj <= 1; dj++)
+      if (roadNet.cells.has((ci + di) + ',' + (cj + dj))) return true;
+    return false;
+  };
+  foliage.scatter(map, sites, { density: 1, avoid: onRoad });
   if (!foliage.group.parent) scene.add(foliage.group);
 }
 
@@ -1122,6 +1167,11 @@ function destroyVehicle(veh, cause) {
   veh.dead = true;
   spawnExplosion(veh.holder.position, veh.type === 'jotun');
   if (veh.isPlayer) { killPlayer(); return; }
+  // Surface what happened to the AI unit — drowned/destroyed units used to just vanish.
+  if (veh.ai && veh.team) {
+    const how = cause === 'sank' ? 'DROWNED' : 'destroyed';
+    aiLog(veh.team, `${veh.ai.p ? veh.ai.p.name : '?'} ${veh.type} ${how}`);
+  }
   removeCombatant(veh);
   if (veh.ai) veh.ai.dead = true;
   scene.remove(veh.group);
@@ -1275,6 +1325,15 @@ function fortHpOf(team) {
   let s = 0;
   for (const c of camps) if (c.team === team) for (const w of c.walls) if (w.body && !w.body.dead) s += w.body.hp;
   return s;
+}
+// Live defensive turrets a team still has — the towers that actually shoot attackers.
+// The commander uses this for tower-first ordering (don't send a runner into live towers).
+function turretCountOf(team) {
+  let n = 0;
+  for (const c of camps) if (c.team === team) for (const w of c.walls) {
+    const t = w.turret; if (t && !t.dead && !t.falling) n++;
+  }
+  return n;
 }
 
 // Capturable flag at every main base. Stolen by any rival unit touching it;
@@ -1480,6 +1539,90 @@ function updateResupplies(dt) {
   }
 }
 
+// --- Ground-unit navigation (A*) ---------------------------------------
+// Units used to greedy-steer at their objective and only dodge walls locally, so a
+// water inlet or a tree clump was a dead end (the Lurcher drowned at the shore, the
+// Firebrat wedged in trees). Now ground units route with A* over the build grid,
+// reusing each vehicle's OWN `_blocked` oracle as the passability test — so walls,
+// the coast (for sinkers) and bump-trees (for the Firebrat) are all impassable, while
+// crushers plough through trees and roads are preferred. Flyers skip this entirely.
+// A* passability for a grid cell — a NAV-specific oracle, gentler than the player's
+// collision `_blocked`: walls keep a smaller margin (so gates/tight spots stay
+// threadable; drive()'s full-radius slide handles the fine bit), gate corridors,
+// roads and elevator pads are explicitly open, and sinkers still avoid open water.
+function cellBlocked(v, i, j) {
+  const c = grid.cell, x = i * c, z = j * c;
+  const halfW = map.worldW / 2 + 24, halfH = map.worldH / 2 + 24;
+  if (x < -halfW || x > halfW || z < -halfH || z > halfH) return true;
+  if (islandBound && x * x + z * z > islandBound * islandBound) return true;
+  if (gateCells.has(i + ',' + j)) return false;
+  if (roadNet.cells && roadNet.cells.has(i + ',' + j)) return false;
+  if (elevatorPadAt(x, z)) return false;
+  const m = v._move;
+  if (m.water === 'sink' && !map.isLand(x, z)) return true;
+  if (!m.ignoreWalls) {
+    const margin = VEH_R * 0.45;
+    for (const o of obstacles) {
+      const dx = x - o.x, dz = z - o.z, rr = o.r + margin;
+      if (dx * dx + dz * dz < rr * rr) return true;
+    }
+  }
+  if (m.tree === 'bump' && foliage && foliage.treeAt(x, z, VEH_R * 0.5)) return true;
+  return false;
+}
+// Nearest open cell to (gi,gj) within `R` rings — lets us aim at a goal that sits
+// inside a wall/water (snap to the closest spot the unit can actually stand).
+function nearestOpenCell(v, gi, gj, R) {
+  if (!cellBlocked(v, gi, gj)) return { i: gi, j: gj };
+  for (let r = 1; r <= R; r++)
+    for (let di = -r; di <= r; di++) for (let dj = -r; dj <= r; dj++) {
+      if (Math.max(Math.abs(di), Math.abs(dj)) !== r) continue;
+      if (!cellBlocked(v, gi + di, gj + dj)) return { i: gi + di, j: gj + dj };
+    }
+  return null;
+}
+// Plan a cell path from the unit to `dest`; returns world waypoints [{x,z}] or null.
+function planPath(v, dest) {
+  const c = grid.cell;
+  const start = { i: Math.round(v.holder.position.x / c), j: Math.round(v.holder.position.z / c) };
+  let goal = { i: Math.round(dest.x / c), j: Math.round(dest.z / c) };
+  goal = nearestOpenCell(v, goal.i, goal.j, 7) || goal;
+  const iMax = Math.ceil(map.worldW / 2 / c) + 10, jMax = Math.ceil(map.worldH / 2 / c) + 10;
+  const inBounds = (i, j) => i >= -iMax && i <= iMax && j >= -jMax && j <= jMax;
+  const roads = roadNet.cells;
+  const cost = (i, j) => {
+    if (cellBlocked(v, i, j)) return Infinity;
+    return roads && roads.has(i + ',' + j) ? 0.5 : 1;   // roads are the cheap lane
+  };
+  const path = astarGrid({ start, goal, cost, inBounds, turnPenalty: 3 });
+  if (!path || path.length < 2) return null;
+  return path.map(n => ({ x: n.i * c, z: n.j * c }));
+}
+// Maintain a unit's cached path toward `dest` and return the next waypoint to steer
+// at (skips waypoints already reached). Replans on a timer, when the goal moves, or
+// when the path runs out. Returns a world {x,z}, or null to fall back to direct seek.
+function navWaypoint(nav, v, dest, dt) {
+  nav.t -= dt;
+  const moved2 = nav.dx == null ? Infinity : (dest.x - nav.dx) ** 2 + (dest.z - nav.dz) ** 2;
+  const c = grid.cell;
+  if (!nav.path || nav.idx >= nav.path.length || nav.t <= 0 || moved2 > (c * 2) ** 2) {
+    nav.path = planPath(v, dest); nav.idx = 0; nav.t = 1.1; nav.dx = dest.x; nav.dz = dest.z;
+    if (!nav.path) return null;
+  }
+  const px = v.holder.position.x, pz = v.holder.position.z;
+  while (nav.idx < nav.path.length - 1) {
+    const w = nav.path[nav.idx];
+    if ((w.x - px) ** 2 + (w.z - pz) ** 2 < (c * 1.3) ** 2) nav.idx++; else break;
+  }
+  return nav.path[nav.idx];
+}
+// Steer a vehicle toward a world point: pivot in place when badly mis-aimed, else drive.
+function steerToward(v, wx, wz) {
+  const dx = wx - v.holder.position.x, dz = wz - v.holder.position.z;
+  const err = wrapPi(Math.atan2(-dx, -dz) - v.heading);
+  return { fwd: Math.abs(err) > 1.2 ? 0 : 1, turn: Math.max(-1, Math.min(1, err * 2.2)) };
+}
+
 class AICommander {
   constructor(team) {
     this.team = team;
@@ -1495,6 +1638,11 @@ class AICommander {
     this.knownSupplies = new Set();                   // fog-of-war: resupply POIs this team has SCOUTED
     this._rising = false; this._elev = null;          // FOB-lift deploy state
     this._exit = null; this._exitT = 0;               // post-deploy "drive out through the gate" waypoint
+    this._nav = { path: null, idx: 0, t: 0, dx: null, dz: null };   // A* path cache
+    this._supply = null;                              // current rearm/refuel point (for nav)
+    this._stepAtDeploy = null;                        // strategy step when this unit deployed (swap only on a NEW step)
+    this._recalling = false;                          // unit is driving home to be swapped (not vanished mid-field)
+    this.failStreak = 0;                              // consecutive unit losses on the current plan (drives adaptive redraws)
   }
 
   start(colorIndex) {
@@ -1505,6 +1653,7 @@ class AICommander {
     for (const c of camps) if (c.team === this.team) c.setAccent(accent);
     const elev = elevators.find(e => e.team === this.team); if (elev) elev.setAccent(accent);
     this.fortHp0 = fortHpOf(this.targetTeam()) || 1;
+    this.targetTurrets0 = turretCountOf(this.targetTeam());   // baseline for tower-first ordering
     this.deploy();
   }
 
@@ -1522,6 +1671,14 @@ class AICommander {
   enemyBasePos() { return teamCenter(this.targetTeam(), 'main'); }
   flag() { return enemyFlagOf(this.team); }
   fortFrac() { return this.fortHp0 ? fortHpOf(this.targetTeam()) / this.fortHp0 : 1; }
+  turretsLive() { return turretCountOf(this.targetTeam()); }
+  // Tower-first: the enemy fort is "breached" (safe to send a Firebrat runner) once
+  // its defensive turrets are mostly gone — not on a blind timer that walked the
+  // runner into live towers. No towers to begin with → breached immediately.
+  fortDown() {
+    const live = this.turretsLive();
+    return live === 0 || live <= (this.targetTurrets0 || 0) * 0.34;
+  }
   // A point just outside the enemy base's lowest-HP wall — where to punch through.
   weakestApproach() {
     const tt = this.targetTeam(), base = this.enemyBasePos();
@@ -1544,10 +1701,12 @@ class AICommander {
   }
 
   // Draw a fresh card (on repeated losses / stalls) — keeps the AI unpredictable.
-  redraw() { this.strategy = drawStrategy(this.personality, Math.random, this.strategy.constructor); this.fortHp0 = fortHpOf(this.targetTeam()) || this.fortHp0; aiLog(this.team, `${this.personality.name} draws ${(this.strategy.constructor.name || 'card').replace('Strategy', '')}`); }
+  redraw() { this.strategy = drawStrategy(this.personality, Math.random, this.strategy.constructor); this.fortHp0 = fortHpOf(this.targetTeam()) || this.fortHp0; this.targetTurrets0 = turretCountOf(this.targetTeam()); this.failStreak = 0; aiLog(this.team, `${this.personality.name} draws ${(this.strategy.constructor.name || 'card').replace('Strategy', '')} (new plan)`); }
 
   deploy() {
     const type = this.strategy.wantVehicle(this);
+    this._stepAtDeploy = this.strategy.step;   // lock the type for this step — no mid-step churn
+    this._recalling = false;
     aiLog(this.team, `${this.personality.name} deploys ${type}`);
     const home = this.homePos();
     const v = new Vehicle(type); v.setScale(0.72);
@@ -1615,26 +1774,111 @@ class AICommander {
       card: (this.strategy.constructor.name || 'Card').replace('Strategy', ''),
       fwd: +cmd.fwd.toFixed(2), turn: +cmd.turn.toFixed(2),
       blk: (view.blockedLeft ? 'L' : '·') + (view.blockedAhead ? 'A' : '·') + (view.blockedRight ? 'R' : '·'),
-      ammo: v.ammo, fuel: Math.round(v.fuel),
+      hp: Math.round(v.hp / v.maxHp * 100), ammo: v.ammo, fuel: Math.round(v.fuel),
       distFob: Math.round(Math.hypot(v.holder.position.x - fob.x, v.holder.position.z - fob.z)),
+      towers: this.turretsLive(),   // enemy turrets still standing (tower-first ordering)
     };
-    if (cmd.state !== prev) aiLog(this.team, `${this.personality.name}: ${cmd.state}`);
+    if (cmd.state !== prev) {
+      let why = '';
+      if (cmd.state === 'retreat') why = ` (hp ${Math.round(v.hp / v.maxHp * 100)}%)`;
+      else if (cmd.state === 'resupply') why = v.ammo <= 0 ? ' (out of ammo)' : ` (fuel ${Math.round(v.fuel / v.maxFuel * 100)}%)`;
+      else if (cmd.state === 'suppress') why = view.threatLOS ? ' (shelling tower)' : ` (flanking ${view.flankSide > 0 ? 'left' : 'right'} of tower)`;
+      else if (cmd.state === 'engage') why = ' (enemy in sight)';
+      else if (cmd.state === 'assault') why = ` (sieging, ${this.turretsLive()} towers left)`;
+      aiLog(this.team, `${this.personality.name} ${v.type}: ${cmd.state}${why}`);
+    }
   }
 
-  // If the strategy now wants a different vehicle than is deployed, recall the
-  // current one so a fitting one rolls out of base next.
-  _swapIfNeeded() {
-    if (!this.unit) return;
-    if (this.unit.type !== this.strategy.wantVehicle(this)) {
-      removeCombatant(this.unit); scene.remove(this.unit.group); this.unit = null; this.respawnT = 2.5; this._rising = false;
+  // Path-follow the long-haul TRAVEL states with A* (advance to the objective, run
+  // home to resupply/retreat, close to siege standoff). Combat (engage/suppress),
+  // the gate exit, and the unstick reflex keep their own tuned steering. Flyers go
+  // straight. Falls back to the brain's seek when there's no route.
+  _navOverride(v, view, cmd, dt) {
+    if (v._move.ignoreWalls) return;
+    const st = cmd.state;
+    let dest = null, slack = 9;
+    if (st === 'exit') { dest = this._exit || this.strategy.objective(this); slack = 5; }   // thread the gate via A*
+    else if (st === 'advance') dest = this.strategy.objective(this);
+    else if (st === 'pursue') dest = v.ai.lastSeen || this.strategy.objective(this);
+    else if (st === 'retreat') dest = this._home;          // heal at own base (only place HP regens)
+    else if (st === 'resupply') dest = this._supply;       // nearest fuel/ammo (own base or a depot)
+    else if (st === 'assault') { dest = this.strategy.objective(this); slack = (view.engageRange || 36) * 0.7 * 1.25; }
+    else return;   // engage / suppress / unstick — leave the steering as-is
+    if (!dest) return;
+    const d2 = (dest.x - v.holder.position.x) ** 2 + (dest.z - v.holder.position.z) ** 2;
+    if (d2 < slack * slack) return;                 // close enough — hand back to the behavior
+    const wp = navWaypoint(this._nav, v, dest, dt);
+    if (!wp) return;                                // no route — keep the brain's command
+    const s = steerToward(v, wp.x, wp.z);
+    cmd.fwd = s.fwd; cmd.turn = s.turn;
+    v.ai._wantMove = s.fwd > 0.3;                   // keep the anti-wedge motion check honest
+  }
+
+  // Decide whether to change the deployed vehicle. We only do this on a DELIBERATE
+  // strategy beat — when the card advances to a new step (e.g. open -> grab = "the
+  // fort's down, send the runner"). Per-tick counter-pick wobble no longer triggers a
+  // swap, which was the churn that made units blink out. And instead of vanishing the
+  // unit, we flag it to DRIVE HOME and get swapped at base (see _driveHome).
+  _maybeRecall() {
+    if (!this.unit || this._recalling) return;
+    if (this.strategy.step === this._stepAtDeploy) return;          // same beat → keep the current unit
+    const want = this.strategy.wantVehicle(this);
+    this._stepAtDeploy = this.strategy.step;                        // consume the step change either way
+    if (this.unit.type === want) return;                           // new beat wants the same vehicle → carry on
+    this._recalling = true; this._recallT = 22;                    // backstop: give up the trip after 22s
+    this._nav.path = null;                                          // replan toward home
+    aiLog(this.team, `${this.personality.name} pulls ${this.unit.type} home to swap for ${want}`);
+  }
+
+  // Drive a recalled unit back to its FOB, then despawn it quietly (no explosion) so
+  // the next deploy rolls out the wanted vehicle — a clean role change, not a suicide.
+  _driveHome(dt) {
+    const v = this.unit;
+    this.strategy.tick(this, dt);
+    applyAltitude(v, dt); decayAim(v, dt); v.cooldown -= dt;
+    if (v.dead) { this.unit = null; this._recalling = false; this.respawnT = 3; return; }
+    const home = teamCenter(this.team, 'fob');
+    const d = Math.hypot(v.holder.position.x - home.x, v.holder.position.z - home.z);
+    const reach = (this._elev ? this._elev.padHalf : 8) + 5;
+    this._recallT -= dt;
+    if (d < reach || this._recallT <= 0) {
+      aiLog(this.team, `${this.personality.name} ${v.type} ${d < reach ? 'home — swapping' : 'recall timed out — swapping'}`);
+      removeCombatant(v); scene.remove(v.group); this.unit = null; this._recalling = false; this.respawnT = 1.0;
+      return;
     }
+    const wp = navWaypoint(this._nav, v, home, dt) || home;
+    const s = steerToward(v, wp.x, wp.z);
+    const out = burnFuel(v, { fwd: s.fwd, turn: s.turn }, dt);
+    v._throttle = Math.min(1, Math.abs(out.fwd) + Math.abs(out.turn) * 0.6);
+    v.drive(dt, out.fwd, out.turn, null, v._blocked);
+    v.ai._wantMove = s.fwd > 0.3;
+    this._dbg = {
+      name: this.personality.name, type: v.type, state: 'return-to-base',
+      card: (this.strategy.constructor.name || 'Card').replace('Strategy', ''),
+      fwd: +s.fwd.toFixed(2), turn: +s.turn.toFixed(2), blk: '···',
+      hp: Math.round(v.hp / v.maxHp * 100), ammo: v.ammo, fuel: Math.round(v.fuel), distFob: Math.round(d),
+      towers: this.turretsLive(),
+    };
   }
 
   update(dt) {
     if (!this.unit || this.unit.dead) {
-      if (this.unit && this.unit.dead) { this.deaths++; if (Math.random() < 0.45) this.redraw(); }
+      if (this.unit && this.unit.dead) {
+        this.deaths++;
+        this.failStreak = (this.failStreak || 0) + 1;
+        // A runner died storming the base → the approach isn't safe yet. Go BACK to
+        // softening (send a heavy to finish the towers) instead of feeding another
+        // Firebrat into the exact same death.
+        if (this.unit.type === 'firebrat' && this.strategy.step === 'grab') {
+          this.strategy.step = 'open'; this.strategy.t = 0;
+          this.targetTurrets0 = turretCountOf(this.targetTeam());
+          aiLog(this.team, `${this.personality.name} runner down — re-softening (towers still up)`);
+        }
+        // Keep losing the same way? Each repeat raises the odds of a brand-new plan.
+        if (Math.random() < Math.min(0.85, 0.25 + this.failStreak * 0.2)) this.redraw();
+      }
       this.unit = null;
-      this._rising = false;
+      this._rising = false; this._recalling = false;
       this.respawnT -= dt;
       if (this.started && this.respawnT <= 0) { this.respawnT = 4 + Math.random() * 3; this.deploy(); }
       return;
@@ -1647,12 +1891,15 @@ class AICommander {
         this._planExit();   // ground units must aim at a GATE and drive out before pursuing
       } else { return; }
     }
+    if (this._recalling) { this._driveHome(dt); return; }   // heading back to base to swap
     this.strategy.tick(this, dt);
-    this._swapIfNeeded();
+    this._maybeRecall();
+    if (this._recalling) return;   // just started the trip home
     const v = this.unit;
-    if (!v) return;          // recalled for a vehicle swap this tick
+    if (!v) return;
     const view = this._view(v, dt);
     const cmd = v.ai.think(view);
+    this._navOverride(v, view, cmd, dt);   // route travel states with A* (around water/trees, through gates)
     this._logTick(v, view, cmd);
     const out = burnFuel(v, { fwd: cmd.fwd, turn: cmd.turn }, dt);
     v._throttle = Math.min(1, Math.abs(out.fwd) + Math.abs(out.turn) * 0.6);   // for spatial engine RPM
@@ -1679,7 +1926,7 @@ class AICommander {
       if (o.dead || o.team === this.team) continue;
       const d = (o.holder.position.x - px) ** 2 + (o.holder.position.z - pz) ** 2;
       if (d < best && (flyer || hasLOS(px, pz, o.holder.position.x, o.holder.position.z))) {
-        best = d; enemy = { x: o.holder.position.x, z: o.holder.position.z }; seen = o; seesEnemy = true;
+        best = d; enemy = { x: o.holder.position.x, z: o.holder.position.z, type: o.type, shield: o.shield }; seen = o; seesEnemy = true;
       }
     }
     // Fog-of-war intel: remember what the enemy keeps fielding so counterVehicle() works.
@@ -1705,6 +1952,15 @@ class AICommander {
     if (fob) consider(fob.center.x, fob.center.z);
     if (home) consider(home.center.x, home.center.z);
     for (const rp of resupplies) if (!rp.dead && rp.kind === wantKind && this.knownSupplies.has(rp)) consider(rp.pos.x, rp.pos.z);
+    this._supply = supply ? { x: supply.center.x, z: supply.center.z } : null;   // nav target while resupplying
+    // HEAL home: HP only regenerates at an OWN base (a neutral fuel/ammo depot can't
+    // patch the hull) — so a hurt unit must fall back HERE, not to the nearest depot,
+    // or it camps a fuel tank forever waiting for health that never comes.
+    let healHome = null, healD = Infinity;
+    const considerHome = (x, z) => { const d = (px - x) ** 2 + (pz - z) ** 2; if (d < healD) { healD = d; healHome = { x, z }; } };
+    if (fob) considerHome(fob.center.x, fob.center.z);
+    if (home) considerHome(home.center.x, home.center.z);
+    this._home = healHome;
     // Post-deploy: drive OUT through the gate first. mustGo forces the brain to head
     // straight for the exit waypoint (no engaging/firing) until it clears the gate.
     let mustGo = false;
@@ -1750,12 +2006,13 @@ class AICommander {
           rx = -Math.sin(h - 0.6), rz = -Math.cos(h - 0.6), P = 9;
     return {
       dt,
-      self: { x: px, z: pz, heading: h, hpFrac: v.hp / v.maxHp, fuelFrac: v.fuel / v.maxFuel, ammoFrac: v.ammo / v.maxAmmo },
+      self: { x: px, z: pz, heading: h, type: v.type, shield: v.shield, hpFrac: v.hp / v.maxHp, fuelFrac: v.fuel / v.maxFuel, ammoFrac: v.ammo / v.maxAmmo },
       seesEnemy, enemy,
       threat, threatLOS, flankSide, engageRange: ENGAGE_RANGE[v.type] || 36,
       goal: mustGo ? this._exit : goal,
       mustGo,
       resupply: supply ? { x: supply.center.x, z: supply.center.z } : goal,
+      home: healHome || goal,
       shootGoal: this.strategy.shoot(this), arriveDist: this.strategy.arriveDist(this),
       blockedAhead: v._blocked(px + fx * P, pz + fz * P),
       blockedLeft: v._blocked(px + lx * P, pz + lz * P),
@@ -1809,6 +2066,66 @@ function showBanner(text, opts = {}) {
   if (!opts.persist) showBanner._t = setTimeout(() => { el.style.opacity = '0'; }, opts.ms || 2600);
 }
 
+// --- Victory / Defeat cinematic ----------------------------------------
+// The win is the player Firebrat riding the stolen flag down the FOB lift. Over
+// that live descent we rain team-colour confetti and pop a big VICTORY! title;
+// a rival capture pops DEFEAT instead. Pure DOM overlay — no extra render passes.
+// TEAM_COLORS[i].hex is already a CSS string ('#rrggbb').
+function teamColor(team) {
+  if (team === PLAYER_TEAM) return TEAM_COLORS[playerColorIndex] ? TEAM_COLORS[playerColorIndex].hex : '#ffffff';
+  const cmd = commanders.find(c => c.team === team && c.colorIndex != null);
+  return cmd && TEAM_COLORS[cmd.colorIndex] ? TEAM_COLORS[cmd.colorIndex].hex : '#ffffff';
+}
+function ensureCelebStyle() {
+  if (document.getElementById('celeb-style')) return;
+  const s = document.createElement('style'); s.id = 'celeb-style';
+  s.textContent = `
+    #celeb-title { position:fixed; top:30%; left:50%; transform:translate(-50%,-50%) scale(0.4);
+      z-index:300; font-family:"Courier New",monospace; font-weight:bold; letter-spacing:8px;
+      font-size:84px; opacity:0; pointer-events:none; white-space:nowrap; text-align:center;
+      text-shadow:0 4px 20px rgba(0,0,0,0.85); transition:opacity .45s ease, transform .6s cubic-bezier(.2,1.35,.4,1); }
+    #celeb-title.in { opacity:1; transform:translate(-50%,-50%) scale(1); }
+    #celeb-title .sub { display:block; margin-top:16px; font-size:21px; letter-spacing:5px; opacity:.85; color:#dfe8ef; }
+    .confetti { position:fixed; top:-24px; width:10px; height:16px; z-index:290; pointer-events:none; will-change:transform; }
+    @keyframes confetti-fall { to { transform:translateY(115vh) rotateZ(720deg); } }`;
+  document.head.appendChild(s);
+}
+function showCelebTitle(text, color, sub) {
+  ensureCelebStyle();
+  let t = document.getElementById('celeb-title');
+  if (!t) { t = document.createElement('div'); t.id = 'celeb-title'; document.body.appendChild(t); }
+  t.style.color = color;
+  t.innerHTML = text + (sub ? `<span class="sub">${sub}</span>` : '');
+  t.classList.remove('in'); void t.offsetWidth;   // restart the pop-in transition
+  requestAnimationFrame(() => t.classList.add('in'));
+}
+function hideCelebTitle() { const t = document.getElementById('celeb-title'); if (t) t.classList.remove('in'); }
+// Rain confetti in (mostly) the team colour with a couple of bright accents. One
+// staggered burst (per-piece CSS animation-delay) rather than a timer, so the rain
+// can't be throttled away when the tab/render loop is busy.
+function rainConfetti(color, durationMs = 5000) {
+  ensureCelebStyle();
+  const palette = [color, color, color, '#ffffff', '#ffd24a'];
+  const secs = durationMs / 1000, N = Math.round(durationMs / 60);
+  for (let i = 0; i < N; i++) {
+    const c = document.createElement('div'); c.className = 'confetti';
+    c.style.left = (Math.random() * 100) + 'vw';
+    c.style.background = palette[(Math.random() * palette.length) | 0];
+    if (Math.random() < 0.5) c.style.borderRadius = '50%';
+    c.style.opacity = (0.75 + Math.random() * 0.25).toFixed(2);
+    const dur = 2.4 + Math.random() * 1.9, delay = Math.random() * secs;
+    c.style.animation = `confetti-fall ${dur.toFixed(2)}s linear ${delay.toFixed(2)}s forwards`;
+    document.body.appendChild(c);
+    setTimeout(() => c.remove(), (delay + dur) * 1000 + 80);
+  }
+}
+function clearCeleb() {
+  hideCelebTitle();
+  document.querySelectorAll('.confetti').forEach(c => c.remove());
+}
+function playVictory(team) { const c = teamColor(team); rainConfetti(c, 6000); showCelebTitle('VICTORY!', c, 'FLAG SECURED'); }
+function playDefeat() { clearCeleb(); showCelebTitle('DEFEAT', '#ff6a6a', 'FLAG LOST'); }
+
 // --- AI decision log (debug overlay) --------------------------------------
 // An on-screen window into what each AI commander is THINKING — live per-unit
 // status + a rolling event feed. Built for phone debugging (no console). Toggle
@@ -1818,16 +2135,19 @@ const aiEvents = [];   // rolling [{t, team, msg}]
 const _t0 = performance.now();
 function aiLog(team, msg) {
   aiEvents.push({ t: (performance.now() - _t0) / 1000, team, msg });
-  while (aiEvents.length > 9) aiEvents.shift();
+  while (aiEvents.length > 18) aiEvents.shift();
 }
 function ensureAiLogEl() {
   let el = document.getElementById('ai-log');
   if (el) return el;
   el = document.createElement('div'); el.id = 'ai-log';
+  // Fixed width (not max-width) so the box doesn't resize/jitter as the text changes;
+  // overflow clipped + tabular digits keep the columns from dancing.
   el.style.cssText = 'position:fixed;top:14px;right:12px;z-index:150;pointer-events:none;' +
     'font-family:"Courier New",monospace;font-size:11px;line-height:1.45;letter-spacing:0.5px;' +
     'color:#dfe8ef;background:rgba(8,12,18,0.72);padding:8px 10px;border:1px solid rgba(255,255,255,0.18);' +
-    'border-radius:5px;max-width:46vw;white-space:pre;text-shadow:0 1px 2px rgba(0,0,0,0.8);';
+    'border-radius:5px;width:330px;max-width:80vw;max-height:90vh;overflow:hidden;white-space:pre;' +
+    'font-variant-numeric:tabular-nums;text-shadow:0 1px 2px rgba(0,0,0,0.8);';
   document.body.appendChild(el);
   return el;
 }
@@ -1840,9 +2160,9 @@ function updateAiLog() {
     const d = cmd._dbg;
     const col = TEAM_ACCENT[cmd.team] || '#aaa';
     if (!d) { html += `<span style="color:${col}">${cmd.team}</span> — deploying…\n`; continue; }
-    html += `<span style="color:${col}">${d.name} ${d.type}</span> ${d.card}\n`;
+    html += `<span style="color:${col}">${d.name} ${d.type}</span> ${d.card}  enemyTwrs:${d.towers}\n`;
     html += `  ${d.state}  blk:${d.blk}  f/t:${d.fwd}/${d.turn}\n`;
-    html += `  fob:${d.distFob}u ammo:${d.ammo} fuel:${d.fuel}\n`;
+    html += `  hp:${d.hp}% ammo:${d.ammo} fuel:${d.fuel}  fob:${d.distFob}u\n`;
   }
   html += '<span style="opacity:0.55">────────────</span>\n';
   for (let i = aiEvents.length - 1; i >= 0; i--) {
@@ -1859,13 +2179,14 @@ function endMatch(winner) {
   matchOver = true;
   const human = TEAM_CTRL[PLAYER_TEAM] === 'human';
   const won = winner === PLAYER_TEAM;
-  const msg = human ? (won ? 'VICTORY' : 'DEFEAT') : `${winner.toUpperCase()} WINS`;
-  showBanner(msg, { big: true, persist: true, color: won || !human ? '#7dff9b' : '#ff7a7a' });
+  if (!human) { playVictory(winner); showCelebTitle(`${winner.toUpperCase()} WINS`, teamColor(winner)); }
+  else if (won) playVictory(PLAYER_TEAM);   // a non-extraction win (e.g. AI ally caps) still celebrates
+  else playDefeat();
   try { if (sound && sound.enabled) sound.toggle(); } catch (e) { /* quiet the engine */ }
   setTimeout(() => {
     const el = document.getElementById('banner'); if (el) el.style.opacity = '0';
     if (human) { if (player && playerElev) { leftPad = true; beginReturn(); } else returnToGarage(); }
-    else { for (const f of flags) f.group.position.set(f.home.x, f.home.y, f.home.z); matchOver = false; }   // AI-vs-AI plays on
+    else { clearCeleb(); for (const f of flags) f.group.position.set(f.home.x, f.home.y, f.home.z); matchOver = false; }   // AI-vs-AI plays on
   }, 5000);
 }
 
@@ -1887,11 +2208,25 @@ function hasLOS(ax, az, bx, bz) {
 // --- Collision ---------------------------------------------------------
 // Solid wall pieces the player can't drive through (gates excluded — drive-through).
 let obstacles = [];           // { x, z, r }
+const gateCells = new Set();  // grid cells the A* navigator treats as always-open (gate corridors)
 let islandBound = 0;          // radius (from map centre) past which no vehicle may go
 function buildObstacles() {
   obstacles = [];
+  gateCells.clear();
+  const c0 = grid.cell;
   for (const c of camps) for (const w of c.walls) {
-    if (w.type && w.type.startsWith('GATE')) continue;
+    if (w.type && w.type.startsWith('GATE')) {
+      // Carve a passable corridor through the opening: the gate cell + a few cells
+      // along its outward normal (in/out), so A* can thread the gap the inflated
+      // wall obstacles would otherwise seal.
+      const gx = w.group.position.x, gz = w.group.position.z;
+      const gi = Math.round(gx / c0), gj = Math.round(gz / c0);
+      const dx = gx - c.center.x, dz = gz - c.center.z;
+      const sx = Math.abs(dx) >= Math.abs(dz) ? Math.sign(dx) : 0;
+      const sz = Math.abs(dx) >= Math.abs(dz) ? 0 : Math.sign(dz);
+      for (let k = -2; k <= 2; k++) gateCells.add((gi + sx * k) + ',' + (gj + sz * k));
+      continue;
+    }
     obstacles.push({ x: w.group.position.x, z: w.group.position.z,
                      r: w.type === 'CORNER' ? grid.cell * 0.7 : grid.cell * 0.5 });
   }
@@ -1964,8 +2299,24 @@ function deployToFOB(type, colorIndex, rise) {
   updateCamera();
 }
 
-// WASD → forward/turn in [-1, 1]. The on-screen touch joystick sets the same keys.
+// Forward/turn in [-1, 1]. Touch: steer toward the held finger (point-to-steer).
+// Keyboard (desktop): WASD/arrows, the classic tank turn + throttle.
 function driveInput() {
+  if (touchSteer && player && !player.dead) {
+    const t = pickWorldPoint(touchSteer.x, touchSteer.y);
+    if (t) {
+      const hp = player.holder.position;
+      const dx = t.point.x - hp.x, dz = t.point.z - hp.z;
+      const distXZ = Math.hypot(dx, dz);
+      const aim = Math.atan2(-dx, -dz);                 // heading whose front (-Z) points at the finger
+      const err = wrapPi(aim - player.heading);
+      const turn = Math.max(-1, Math.min(1, err * 2.4));
+      // Pivot in place when badly mis-aimed (>~75°) so we don't arc wide; otherwise
+      // drive forward, easing to a stop once the finger sits on the vehicle.
+      const fwd = Math.abs(err) > 1.3 ? 0 : (distXZ < TOUCH_STOP_R ? 0 : 1);
+      return { fwd, turn };
+    }
+  }
   const fwd  = (keys['w'] || keys['arrowup']   ? 1 : 0) - (keys['s'] || keys['arrowdown']  ? 1 : 0);
   const turn = (keys['a'] || keys['arrowleft'] ? 1 : 0) - (keys['d'] || keys['arrowright'] ? 1 : 0);
   return { fwd, turn };
@@ -2113,13 +2464,29 @@ function setGarageOverlays(show) {
 function setFieldUI(show) {
   const hud = document.getElementById('hud');
   if (hud) hud.style.display = show ? '' : 'none';
+  // The old drive stick + fire button are retired: touch now steers toward the finger
+  // and taps to fire (see the canvas touch handlers). Keep them hidden either way.
   for (const id of ['touch-joystick', 'fire-btn']) {
     const el = document.getElementById(id);
-    if (!el) continue;
-    if (show && touchUsed) el.classList.add('visible');
-    else el.classList.remove('visible');
+    if (el) el.classList.remove('visible');
   }
+  const tog = ensureLogToggle(); tog.style.display = show ? 'flex' : 'none';   // phone-friendly AI-log toggle
   if (!show) fireHeld = false;   // don't carry a held shot back into the garage
+}
+// A small always-reachable button to flip the AI decision log (no keyboard on a phone).
+function ensureLogToggle() {
+  let b = document.getElementById('ailog-toggle');
+  if (b) return b;
+  b = document.createElement('div'); b.id = 'ailog-toggle'; b.textContent = 'AI';
+  b.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:160;width:46px;height:46px;border-radius:50%;' +
+    'display:flex;align-items:center;justify-content:center;font-family:"Courier New",monospace;font-weight:bold;' +
+    'font-size:13px;letter-spacing:1px;color:#dfe8ef;background:rgba(8,12,18,0.6);border:1px solid rgba(255,255,255,0.3);' +
+    'box-shadow:0 2px 8px rgba(0,0,0,0.3);user-select:none;-webkit-user-select:none;touch-action:manipulation;cursor:pointer;';
+  b.style.opacity = aiLogOn ? '1' : '0.55';
+  const toggle = e => { e.preventDefault(); e.stopPropagation(); aiLogOn = !aiLogOn; b.style.opacity = aiLogOn ? '1' : '0.55'; updateAiLog(); };
+  b.addEventListener('pointerdown', toggle);
+  document.body.appendChild(b);
+  return b;
 }
 
 // Build the garage scene + its UI/handlers. Called once via ensureGarage() — at
@@ -2235,6 +2602,10 @@ function enterField() {
 function beginReturn() {
   returning = true;
   driving = false;
+  // Riding a stolen enemy flag down the lift IS the win — kick off the cinematic.
+  victoryReturn = !!flags.find(f => f.carried && f.carrier === player);
+  victoryHoldT = 0;
+  if (victoryReturn) playVictory(PLAYER_TEAM);
   clearLock();
   try { if (sound && sound.enabled) sound.toggle(); } catch (e) { /* audio is best-effort */ }   // engine winds down as it parks + lowers
   const h = Math.atan2(playerElev.center.x, playerElev.center.z);
@@ -2263,9 +2634,9 @@ function returnToGarage() {
   if (captured) {
     captured.carried = false; captured.carrier = null; captured.returnT = 0;
     captured.group.position.set(captured.home.x, captured.home.y, captured.home.z);   // flag back on its post
-    flagsCaptured++;
-    showBanner('FLAG SECURED — VICTORY', { big: true, color: '#7dff9b', ms: 4600 });
+    flagsCaptured++;   // the VICTORY cinematic already played over the descent (playVictory)
   }
+  clearCeleb();        // tidy any confetti/title before the hangar shows
 }
 
 // Security-camera overlay for the garage: vignette + scanlines + REC + clock.
@@ -2444,6 +2815,24 @@ window.RR = {
   get onField() { return onField; },
   get returning() { return returning; },
   forceReturn: () => { if (player && playerElev) { leftPad = true; beginReturn(); } },
+  // Preview the end-of-match cinematic without playing a whole round.
+  celebrate: (kind = 'victory', team = PLAYER_TEAM) => kind === 'defeat' ? playDefeat() : playVictory(team),
+  navPlan: (v, x, z) => planPath(v, { x, z }),                 // debug: A* path for a unit
+  navCellBlocked: (v, i, j) => cellBlocked(v, i, j),          // debug: nav passability of a cell
+  get gateCells() { return [...gateCells]; },
+  // Fast-forward the field sim by fixed steps (headless verification runs ~0.2x
+  // real-time, so this advances GAME time without waiting on the slow renderer).
+  stepField: (dt = 0.05, n = 1) => {
+    for (let k = 0; k < n; k++) {
+      if (matchOver) break;
+      updateCommanders(dt);
+      for (const e of elevators) e.update(dt);
+      for (const v of vehicles) v.idle(dt);
+      projectiles.update(dt); updateProjectileHits();
+      destructibles.update(dt);
+      updateResupplies(dt); updateWallTurrets(dt); updateLock(dt);
+    }
+  },
   blockedAt: (x, z) => blockedAt(x, z),
   get obstacles() { return obstacles; },
   get grid() { return grid; },
@@ -2573,7 +2962,17 @@ function animate() {
     updateEngineSounds();                  // spatial enemy/AI engine noise (distance-based)
     renderer.render(scene, camera);
     if (fade) {
-      if (returning) {
+      if (returning && victoryReturn) {
+        // Victory: stay clear so the confetti + descending Firebrat are visible,
+        // hold a beat at the bottom on the celebration, then fade to the garage.
+        if (playerElev && playerElev.phase === 'down') {
+          victoryHoldT += dt;
+          fade.style.opacity = Math.max(0, (victoryHoldT - VICT_HOLD) / 0.6);
+          if (victoryHoldT > VICT_HOLD + 0.6) { victoryReturn = false; returnToGarage(); }
+        } else {
+          fade.style.opacity = 0;
+        }
+      } else if (returning) {
         // Fade to black as the lift nears the bottom; hand back to the garage at the floor.
         const k = playerElev ? (playerElev.lift.position.y - playerElev.bottomY) / playerElev.depth : 0;
         fade.style.opacity = Math.max(0, Math.min(1, 1 - k * 2.5));   // black over the last ~40%

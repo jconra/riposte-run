@@ -46,7 +46,7 @@ class Strategy {
 // runner once the fortifications buckle. Favoured by aggressive personalities.
 class Blitz extends Strategy {
   static weight(p) { return 0.2 + p.aggression * 1.2; }
-  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && (cmd.fortFrac() < 0.5 || this.t > 35)) this.step = 'grab'; }
+  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && (cmd.fortDown() || this.t > 75)) this.step = 'grab'; }
   wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : this._heavy; }
   objective(cmd) { return this.step === 'grab' ? this._flagOrHome(cmd) : cmd.enemyBasePos(); }
   shoot(cmd) { return this.step !== 'grab'; }
@@ -56,7 +56,7 @@ class Blitz extends Strategy {
 // heavy, then slip a Firebrat through the gap to the flag. Patient, sneaky.
 class FlankBreach extends Strategy {
   static weight(p) { return 0.5 + (1 - p.aggression) * 0.8 + p.jitter; }
-  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && (cmd.fortFrac() < 0.62 || this.t > 40)) this.step = 'grab'; }
+  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && (cmd.fortDown() || this.t > 85)) this.step = 'grab'; }
   wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : this._heavy; }
   objective(cmd) { return this.step === 'grab' ? this._flagOrHome(cmd) : cmd.weakestApproach(); }
   shoot(cmd) { return this.step !== 'grab'; }
@@ -76,18 +76,19 @@ class AirSnatch extends Strategy {
 // and destroy their vehicles, then grab the flag once they're thinned out.
 class Hunter extends Strategy {
   static weight(p) { return 0.3 + p.aggression * 0.7; }
-  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && this.t > 38) this.step = 'grab'; }
+  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && (cmd.fortDown() || this.t > 70)) this.step = 'grab'; }
   wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : cmd.counterVehicle(); }
   objective(cmd) { return this.step === 'grab' ? this._flagOrHome(cmd) : cmd.enemyBasePos(); }
   shoot(cmd) { return this.step !== 'grab'; }
 }
 
-// SCOUT & SNATCH — fast recon to reveal the field, then an immediate Firebrat
-// dash for the flag, betting on speed over firepower. Favoured by cautious types.
+// SCOUT & SNATCH — a Valkyrie flies recon to reveal the field + supply points (it
+// sees over walls and crosses water, the best scout), then a Firebrat dashes for the
+// flag once the towers are down. Favoured by cautious types.
 class ScoutSnatch extends Strategy {
   static weight(p) { return 0.3 + p.defensiveness * 0.8; }
-  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && this.t > 12) this.step = 'grab'; }
-  wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : this._fast; }
+  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && (cmd.fortDown() || this.t > 55)) this.step = 'grab'; }
+  wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : 'valkyrie'; }
   objective(cmd) { return this.step === 'grab' ? this._flagOrHome(cmd) : cmd.enemyBasePos(); }
   shoot(cmd) { return false; }
   arriveDist(cmd) { return this.step === 'grab' ? 3 : 30; }

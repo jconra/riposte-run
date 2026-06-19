@@ -91,6 +91,7 @@ export class Foliage {
         if (dx * dx + dz * dz < baseR2) { skip = true; break; }
       }
       if (skip) continue;
+      if (opts.avoid && opts.avoid(x, z)) continue;   // e.g. keep clear of roads
 
       // Choose a category by terrain: grass is lush, sand is sparse.
       let cat;

@@ -6,6 +6,24 @@ import * as THREE from 'three';
 
 let _id = 0;
 
+// Progressive battle-damage look. Scorch = the colour a battered surface fades toward.
+const SCORCH = new THREE.Color('#241f1b');
+const CRACK_STAGES = 4;
+// Draw a few jagged dark fractures (with a faint highlight for depth) onto a texture
+// canvas. Called cumulatively — each stage scratches more cracks over the last.
+function drawCracks(ctx, w, h, frac) {
+  ctx.lineCap = 'round';
+  const n = 2 + Math.floor(frac * 4);
+  for (let i = 0; i < n; i++) {
+    let x = Math.random() * w, y = Math.random() * h;
+    ctx.beginPath(); ctx.moveTo(x, y);
+    const segs = 3 + (Math.random() * 3 | 0);
+    for (let s = 0; s < segs; s++) { x += (Math.random() - 0.5) * w * 0.5; y += (Math.random() - 0.5) * h * 0.5; ctx.lineTo(x, y); }
+    ctx.strokeStyle = 'rgba(15,12,9,0.9)'; ctx.lineWidth = 1 + Math.random() * 1.6; ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 1; ctx.stroke();
+  }
+}
+
 export class Destructible {
   // mesh: the intact THREE.Object3D (already positioned in its parent).
   // opts.hp        — hit points
@@ -26,9 +44,11 @@ export class Destructible {
     this.dead = false;
     this.rubble = null;
 
-    // Damage feedback state.
+    // Damage feedback state. Materials are cloned per-object on first hit so scarring
+    // THIS prop never bleeds onto others sharing the same material/texture.
     this._flash = 0;
-    this._origEmissive = [];
+    this._unique = null;
+    this._stage = 0;       // highest crack stage drawn so far
 
     this._worldCenter = new THREE.Vector3();
     this._radius = 1;
@@ -51,9 +71,49 @@ export class Destructible {
   damage(amount, point) {
     if (this.dead || amount <= 0) return;
     this.hp -= amount;
-    this._flash = 1; // brief white-hot flash on hit
+    this._flash = 1;        // white-hot flash on hit
+    this._applyWear();      // deepen scorch + cracks for the new HP level
     if (this.onDamage) this.onDamage(this);
     if (this.hp <= 0) this._destroy();
+  }
+
+  // Clone this object's materials (and any texture maps) so progressive damage marks
+  // only THIS prop, not everything sharing the original material/texture.
+  _makeUnique() {
+    this._unique = [];
+    this.mesh.traverse(o => {
+      if (!o.isMesh || !o.material) return;
+      const arr = Array.isArray(o.material) ? o.material : [o.material];
+      const cloned = arr.map(m => {
+        const c = m.clone();
+        const u = { mat: c, base: c.color ? c.color.clone() : null };
+        if (c.map && c.map.image) {
+          const img = c.map.image, w = img.width || 128, h = img.height || 128;
+          const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+          const ctx = cv.getContext('2d'); ctx.drawImage(img, 0, 0, w, h);
+          const tex = new THREE.CanvasTexture(cv);
+          tex.colorSpace = c.map.colorSpace; tex.wrapS = c.map.wrapS; tex.wrapT = c.map.wrapT;
+          tex.repeat.copy(c.map.repeat); tex.anisotropy = c.map.anisotropy;
+          c.map = tex; u.ctx = ctx; u.tex = tex; u.w = w; u.h = h;
+        }
+        this._unique.push(u);
+        return c;
+      });
+      o.material = Array.isArray(o.material) ? cloned : cloned[0];
+    });
+  }
+
+  // Darken toward scorch + scratch in new cracks as HP falls.
+  _applyWear() {
+    const sev = this.maxHp ? 1 - Math.max(0, this.hp) / this.maxHp : 0;
+    if (sev <= 0) return;
+    if (!this._unique) this._makeUnique();
+    for (const u of this._unique) if (u.base) u.mat.color.copy(u.base).lerp(SCORCH, sev * 0.55);
+    const stage = Math.min(CRACK_STAGES, Math.ceil(sev * CRACK_STAGES));
+    while (this._stage < stage) {
+      this._stage++;
+      for (const u of this._unique) if (u.ctx) { drawCracks(u.ctx, u.w, u.h, this._stage / CRACK_STAGES); u.tex.needsUpdate = true; }
+    }
   }
 
   _destroy() {
@@ -71,17 +131,20 @@ export class Destructible {
     if (this.onDestroyed) this.onDestroyed(this);
   }
 
-  // Per-frame: decay the hit flash. (Cheap; only touches materials when flashing.)
+  // Per-frame: white flash decays; a damaged prop keeps a faint warm ember glow at its
+  // cracks so you can read how hurt it is. Only touches materials while flashing/damaged
+  // (and by then they've been cloned, so this never leaks onto other props).
   update(dt) {
-    if (this._flash > 0 && !this.dead) {
-      this._flash = Math.max(0, this._flash - dt * 4);
-      const k = this._flash;
-      this.mesh.traverse(o => {
-        if (o.isMesh && o.material && o.material.emissive) {
-          o.material.emissive.setRGB(k, k, k);
-        }
-      });
-    }
+    if (this.dead) return;
+    if (this._flash > 0) this._flash = Math.max(0, this._flash - dt * 3.2);
+    const sev = this.maxHp ? 1 - Math.max(0, this.hp) / this.maxHp : 0;
+    if (this._flash <= 0 && sev <= 0) return;
+    const k = this._flash;
+    this.mesh.traverse(o => {
+      if (!o.isMesh || !o.material) return;
+      const arr = Array.isArray(o.material) ? o.material : [o.material];
+      for (const m of arr) if (m.emissive) m.emissive.setRGB(k + sev * 0.16, k * 0.85, k * 0.7);
+    });
   }
 }
 
