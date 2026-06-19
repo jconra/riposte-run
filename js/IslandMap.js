@@ -38,6 +38,11 @@ const C = {
 
 // Tile type codes used by gameplay sampling.
 export const TILE = { DEEP: 0, SHALLOW: 1, SAND: 2, GRASS: 3, ROCK: 4 };
+// Water-floor depth at/above which a land vehicle can WADE (ford) rather than
+// drown. Floors run roughly -2.4 (sea bed) to 0 (shoreline); -0.8 leaves the
+// shallow coastal fringe + puddles passable while the open sea (~85%) stays deep.
+// Lower (more negative) = less wadeable water; raise toward 0 to ford less.
+const FORD_DEPTH = -0.8;
 
 function smoothstep(a, b, x) {
   const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
@@ -468,6 +473,24 @@ export class IslandMap {
   isLand(x, z) {
     const t = this.tileAt(x, z);
     return t === TILE.SAND || t === TILE.GRASS || t === TILE.ROCK;
+  }
+
+  // Raw terrain height, NOT clamped to the waterline like heightAt — so it reads
+  // negative under water (used to sit a wading vehicle at the actual floor depth).
+  floorAt(x, z) {
+    const ci = this._cellAt(x, z);
+    return ci == null ? FORD_DEPTH - 1 : this.tileH[ci];
+  }
+
+  // DEEP water = floor deeper than the ford limit; ground vehicles can't cross it
+  // (and sink in it). The shallow fringe above FORD_DEPTH — shorelines, puddles,
+  // narrow inlets — is fordable: land vehicles WADE through instead of treating
+  // every splash of water as a wall. Off-map reads as deep (the world's ocean
+  // wall). Tuned against the map's depth spread (floors run ~-2.4..0).
+  isDeepWater(x, z) {
+    const ci = this._cellAt(x, z);
+    if (ci == null) return true;
+    return this.tileH[ci] < FORD_DEPTH;
   }
 
   heightAt(x, z) {

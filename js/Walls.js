@@ -351,8 +351,10 @@ export class Camp {
       obj.position.set(wx, groundY, wz);
       obj.rotation.y = yaw;
       this.group.add(obj);
-      manager.add(new Destructible(obj, { type: 'building', hp, makeRubble: rubblePile(cell) }));
+      const d = new Destructible(obj, { type: 'building', hp, makeRubble: rubblePile(cell) });
+      manager.add(d);
       this.buildings.push(obj);
+      return d;
     };
     const addCell = (obj, ix, iz, hp, yaw = 0) => {
       const w = grid.cellToWorld(centerCell.cx + ix, centerCell.cz + iz);
@@ -364,7 +366,10 @@ export class Camp {
       // (carved shaft + rising lift). The old flat makeElevator pad is retired.
       void makeElevator; void centreX; void centreZ;
     } else {
-      addAt(makeFlagHQ(cell, accent), centreX, centreZ, 600);     // centre; ring around = road
+      // The HQ wears the team flag on its roof. The capturable flag (main.js) is
+      // hidden inside until this building falls — so we keep a handle to its
+      // Destructible for the reveal check.
+      this.flagHQ = addAt(makeFlagHQ(cell, accent), centreX, centreZ, 600);   // centre; ring around = road
       addCell(makeAdmin(cell, accent), inLo, inHi, 160);
       addCell(makeQuonset(cell, accent), inHi, inHi, 140, Math.PI / 2);
       addCell(makeBarracks(cell, accent), inLo, inLo, 120);

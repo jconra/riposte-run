@@ -19,7 +19,7 @@
 // `Brain.think()` is now a thin wrapper around runBrain(DEFAULT_BRAIN, …); assign a
 // different graph to a brain's `.graph` to change its behavior.
 
-import { COUNTER } from './AIStrategies.js';   // rock-paper-scissors web for fight-or-flight matchups
+import { COUNTER } from './AIStrategies.js?v=50';   // rock-paper-scissors web for fight-or-flight matchups
 
 const TYPES = ['lurcher', 'firebrat', 'valkyrie', 'jotun'];
 const CALLSIGNS = ['Viper', 'Rook', 'Ghost', 'Talon', 'Hammer', 'Wraith', 'Jackal',
@@ -135,10 +135,28 @@ const BEHAVIORS = {
   // 'engage' (mobile duel — aggressive brains press closer) and 'suppress' (keep a
   // wall-turret at arm's length and arc around its flank to find a clean line).
   combat(ctx) {
-    const { view, mem, p, err, dist, mode } = ctx;
+    const { view, mem, p, err, dist, mode, self } = ctx;
     const aimGate = 0.18 + p.aggression * 0.12;
     const want = view.engageRange || 36;
     const range = mode === 'suppress' ? want : want * (1 - p.aggression * 0.45);
+    // SIEGE DOCTRINE: silence a turret from a spot where only IT can hit back. If we
+    // already have a clean line on the tower, PLANT and pour fire (don't wander off a
+    // good shot). Otherwise drive to the radial standoff — outside the base through
+    // the turret, away from the other towers' arcs — which also squares us onto it.
+    if (mode === 'suppress' && view.threatStand) {
+      const canHit = view.threatLOS && Math.abs(err) < (aimGate + 0.08);
+      if (canHit) {
+        const turn = clamp(err * 2.2, -1, 1);
+        const fwd = dist > want ? 0.5 : 0;                  // edge closer only if out of reach
+        const fire = dist < want * 1.2 ? mem.rng() < (0.7 + p.aggression * 0.3) * AI_HANDICAP.fireProb : false;
+        mem._wantMove = fwd > 0.3;
+        return { fwd, turn, fire, state: mode };
+      }
+      const dsx = view.threatStand.x - self.x, dsz = view.threatStand.z - self.z;   // no clean shot → reposition
+      const eMove = wrapPi(Math.atan2(-dsx, -dsz) - self.heading);
+      mem._wantMove = true;
+      return { fwd: 1, turn: clamp(eMove * 2.0, -1, 1), fire: false, state: mode };
+    }
     const los = mode !== 'suppress' || view.threatLOS;   // duel target is always visible
     let steer = err;
     if (mode === 'suppress' && view.flankSide) {
@@ -294,7 +312,7 @@ export function runBrain(graph, view, mem) {
   // Vehicle front is local -Z → forward = (-sin h, -cos h), so aim = atan2(-dx,-dz).
   const aim = Math.atan2(-dx, -dz);
   const err = wrapPi(aim - self.heading) + (mem.rng() - 0.5) * p.jitter * 0.6 * AI_HANDICAP.aimSpread;
-  const ctx = { view, mem, p, cfg, mode, target, dist, err };
+  const ctx = { view, mem, p, cfg, mode, target, dist, err, self };
 
   const stateDef = graph.states[mode];
   // Whisker wall-follow for any state that doesn't opt out (exit drives itself out).

@@ -46,7 +46,7 @@ class Strategy {
 // runner once the fortifications buckle. Favoured by aggressive personalities.
 class Blitz extends Strategy {
   static weight(p) { return 0.2 + p.aggression * 1.2; }
-  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && (cmd.fortDown() || this.t > 75)) this.step = 'grab'; }
+  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && cmd.flagExposed() && (cmd.fortDown() || this.t > 75)) this.step = 'grab'; }
   wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : this._heavy; }
   objective(cmd) { return this.step === 'grab' ? this._flagOrHome(cmd) : cmd.enemyBasePos(); }
   shoot(cmd) { return this.step !== 'grab'; }
@@ -56,27 +56,30 @@ class Blitz extends Strategy {
 // heavy, then slip a Firebrat through the gap to the flag. Patient, sneaky.
 class FlankBreach extends Strategy {
   static weight(p) { return 0.5 + (1 - p.aggression) * 0.8 + p.jitter; }
-  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && (cmd.fortDown() || this.t > 85)) this.step = 'grab'; }
+  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && cmd.flagExposed() && (cmd.fortDown() || this.t > 85)) this.step = 'grab'; }
   wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : this._heavy; }
   objective(cmd) { return this.step === 'grab' ? this._flagOrHome(cmd) : cmd.weakestApproach(); }
   shoot(cmd) { return this.step !== 'grab'; }
 }
 
-// AIR SNATCH — a Valkyrie ignores walls entirely: fly straight in, lift the flag,
-// fly it home. High-risk wildcard; loves a daring commander.
+// AIR SNATCH — a Valkyrie ignores walls entirely: fly straight in and shell the
+// HQ open from point-blank (only a Firebrat can lift the flag, so the air unit
+// can't grab — it's the breacher). Once the flag is exposed, a Firebrat dashes in
+// and runs it home. High-risk wildcard; loves a daring commander.
 class AirSnatch extends Strategy {
   static weight(p) { return 0.3 + p.wanderlust * 0.9; }
-  wantVehicle(cmd) { return 'valkyrie'; }
-  objective(cmd) { return this._flagOrHome(cmd); }
-  shoot(cmd) { return false; }
-  arriveDist(cmd) { return 3; }
+  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && cmd.flagExposed()) this.step = 'grab'; }
+  wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : 'valkyrie'; }
+  objective(cmd) { return this.step === 'grab' ? this._flagOrHome(cmd) : cmd.enemyBasePos(); }
+  shoot(cmd) { return this.step !== 'grab'; }   // valkyrie cracks the HQ; runner holds fire
+  arriveDist(cmd) { return this.step === 'grab' ? 3 : 8; }
 }
 
 // HUNTER — field the COUNTER to whatever the enemy keeps fielding, roam to find
 // and destroy their vehicles, then grab the flag once they're thinned out.
 class Hunter extends Strategy {
   static weight(p) { return 0.3 + p.aggression * 0.7; }
-  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && (cmd.fortDown() || this.t > 70)) this.step = 'grab'; }
+  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && cmd.flagExposed() && (cmd.fortDown() || this.t > 70)) this.step = 'grab'; }
   wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : cmd.counterVehicle(); }
   objective(cmd) { return this.step === 'grab' ? this._flagOrHome(cmd) : cmd.enemyBasePos(); }
   shoot(cmd) { return this.step !== 'grab'; }
@@ -87,7 +90,7 @@ class Hunter extends Strategy {
 // flag once the towers are down. Favoured by cautious types.
 class ScoutSnatch extends Strategy {
   static weight(p) { return 0.3 + p.defensiveness * 0.8; }
-  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && (cmd.fortDown() || this.t > 55)) this.step = 'grab'; }
+  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && cmd.flagExposed() && (cmd.fortDown() || this.t > 55)) this.step = 'grab'; }
   wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : 'valkyrie'; }
   objective(cmd) { return this.step === 'grab' ? this._flagOrHome(cmd) : cmd.enemyBasePos(); }
   shoot(cmd) { return false; }

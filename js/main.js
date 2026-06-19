@@ -3,11 +3,11 @@
 // with a live controls panel. Garage + vehicles land in later milestones.
 
 import * as THREE from 'three';
-import { IslandMap, DEFAULTS } from './IslandMap.js';
+import { IslandMap, DEFAULTS } from './IslandMap.js?v=50';
 import { Controls } from './Controls.js';
 import { DestructibleManager, Destructible } from './Destructible.js';
 import { BuildGrid } from './BuildGrid.js';
-import { Camp } from './Walls.js';
+import { Camp } from './Walls.js?v=50';
 import { RoadNetwork } from './Roads.js';
 import { Foliage } from './Foliage.js';
 import { Vehicle, VEHICLE_TYPES } from './Vehicles.js';
@@ -16,8 +16,8 @@ import { Garage } from './Garage.js';
 import { TEAM_COLORS, updateCamo, camoParams } from '../../vehicle-designer/js/CamoTexture.js';
 import { SoundManager } from '../../vehicle-designer/js/SoundManager.js';
 import { Projectiles } from '../../vehicle-designer/js/Projectiles.js';
-import { Brain, randomPersonality } from './AI.js';
-import { drawStrategy, COUNTER } from './AIStrategies.js';
+import { Brain, randomPersonality } from './AI.js?v=50';
+import { drawStrategy, COUNTER } from './AIStrategies.js?v=50';
 import { astarGrid } from './astar.js';
 import { makeFuelTank, makeAmmoDepot, makeShieldGenerator, makeShieldBubble, RESUPPLY_TINT } from './Resupply.js';
 
@@ -614,6 +614,12 @@ const VEH_HIT_R = { lurcher: 3.2, firebrat: 2.0, valkyrie: 3.0, jotun: 3.6 };
 // Firebrat has to close to use its short forward gun. Drives both duels and the
 // turret-suppression standoff (see AI.js engage/suppress).
 const ENGAGE_RANGE = { lurcher: 50, firebrat: 24, valkyrie: 50, jotun: 70 };
+// Where a unit SITS to silence a wall-turret — the standoff is placed radially
+// OUTSIDE the base through the target turret, so only that one turret bears on it
+// (no crossfire from the others). The Jotun parks beyond TURRET_RANGE (54) so it
+// out-snipes the tower untouched; the Valkyrie flies its arc in; the Lurcher (no
+// fly, sinks in water) sits at the corner and busts that tower/wall the hard way.
+const TURRET_HOLD = { jotun: 64, valkyrie: 46, lurcher: 46, firebrat: 26 };
 
 // Movement personality per type. cruise = rest altitude above the surface;
 // ignoreWalls = flies over base walls; water = 'cross' (hover/fly) or 'sink'
@@ -778,7 +784,7 @@ function fireVehicle(veh, playSound, targetPoint = null, targetVeh = null) {
     if (guaranteed) {
       // Land the damage directly on the locked target; the slug is just a visual.
       const dist = targetVeh.holder.position.distanceTo(mpos);
-      damageVehicle(targetVeh, SHOT_DMG[idx] * rangeFalloff(veh.type, dist));
+      damageVehicle(targetVeh, SHOT_DMG[idx] * rangeFalloff(veh.type, dist), 'vehicle');
       projectiles.spawn(idx, mpos, dir, hex);   // no dmg payload → updateProjectileHits ignores it
     } else if (idx === 1) {
       // Firebrat laser = hitscan: damage the first thing along the beam now.
@@ -1014,12 +1020,17 @@ function damageVehiclesAt(point, blast, dmg, team, shooter) {
     if (v.dead || v === shooter) continue;
     if (team != null && v.team === team) continue;
     const reach = blast + v.hitR;
-    if (v.holder.position.distanceToSquared(point) <= reach * reach) damageVehicle(v, dmg);
+    if (v.holder.position.distanceToSquared(point) <= reach * reach) damageVehicle(v, dmg, 'vehicle');
   }
 }
 
-function damageVehicle(veh, amount) {
+// Running tally of damage dealt to vehicles, by source — powers siege diagnostics
+// (are attackers dying to towers or to enemy vehicles?) and a future kill feed.
+const dmgTally = { turret: 0, vehicle: 0, tree: 0, other: 0 };
+function damageVehicle(veh, amount, cause = 'other') {
   if (veh.dead) return;
+  dmgTally[cause] = (dmgTally[cause] || 0) + amount;
+  if (veh.ai) veh._dmgBy = veh._dmgBy || { turret: 0, vehicle: 0, tree: 0, other: 0 }, veh._dmgBy[cause] += amount;
   // The shield pool soaks damage before the hull (body-armour style).
   if (veh.shield > 0) {
     const absorbed = Math.min(veh.shield, amount);
@@ -1043,7 +1054,7 @@ function raycastDamage(origin, dir, maxDist, dmg, blast, team, shooter) {
     if (hv) {
       // Hit the DETECTED vehicle directly — the detection pad (2.5) is wider than
       // the tiny splash reach, so a point-blast here would miss what the beam met.
-      damageVehicle(hv, dmg);
+      damageVehicle(hv, dmg, 'vehicle');
       spawnImpact(hv.holder.position, blast);
       return;
     }
@@ -1094,7 +1105,7 @@ function updateWallTurrets(dt) {
         t._cd = TURRET_CD;
         // Damage the locked target directly (with range falloff) + a cosmetic tracer.
         // Direct, so the slug can't clip the turret's OWN walls on the way out.
-        damageVehicle(target, TURRET_DMG * turretFalloff(Math.sqrt(bestD)));
+        damageVehicle(target, TURRET_DMG * turretFalloff(Math.sqrt(bestD)), 'turret');
         _tDir.copy(tp).sub(_tHead).normalize();
         const hex = TEAM_ACCENT[c.team] ? new THREE.Color(TEAM_ACCENT[c.team]).getHex() : 0xffd0a0;
         projectiles.spawn(0, _tHead.clone(), _tDir.clone(), hex);   // cosmetic tracer toward the target
@@ -1205,7 +1216,7 @@ function blockedFor(move, avoidWater) {
     const cx = Math.round(x / grid.cell), cz = Math.round(z / grid.cell);
     if (roadNet.cells && roadNet.cells.has(cx + ',' + cz)) return false;
     if (elevatorPadAt(x, z)) return false;
-    if (avoidWater && move.water === 'sink' && !map.isLand(x, z)) return true;
+    if (avoidWater && move.water === 'sink' && map.isDeepWater(x, z)) return true;   // shallow is fordable
     if (move.ignoreWalls) return false;              // Valkyrie clears walls
     for (const o of obstacles) {
       const dx = x - o.x, dz = z - o.z, rr = o.r + VEH_R;
@@ -1223,15 +1234,20 @@ function applyAltitude(veh, dt) {
   const deck = elevatorPadAt(x, z);
   const terrain = deck ? deck.groundY : map.heightAt(x, z);
   const overWater = !deck && !map.isLand(x, z);
+  const deepWater = !deck && map.isDeepWater(x, z);   // only the deep part drowns a sinker
   let target;
   if (m.water === 'sink') {
-    if (overWater) {
+    if (deepWater) {
       veh._sink += dt * SINK_RATE;
       target = -veh._sink;
       if (veh._sink >= SINK_KILL) { destroyVehicle(veh, 'sank'); return; }
     } else {
+      // land OR shallow water → ride the actual floor (negative in shallow water, so
+      // the hull sits partly submerged and reads as WADING, not floating on top),
+      // bleeding off any sink it built up wading out of the deep.
       veh._sink = Math.max(0, veh._sink - dt * SINK_RATE * 1.6);
-      target = terrain + 0.05 - veh._sink;
+      const floor = deck ? deck.groundY : map.floorAt(x, z);
+      target = floor + 0.05 - veh._sink;
     }
   } else {
     const base = overWater ? 0 : terrain;
@@ -1244,7 +1260,7 @@ function applyAltitude(veh, dt) {
     const t = foliage.treeAt(x, z, veh.hitR * 0.5);
     if (t) {
       if (m.tree === 'crush') { foliage.fellTree(t); }
-      else if (m.tree === 'bump' && veh._touchTree !== t) { veh._touchTree = t; damageVehicle(veh, TREE_BUMP_DMG); }
+      else if (m.tree === 'bump' && veh._touchTree !== t) { veh._touchTree = t; damageVehicle(veh, TREE_BUMP_DMG, 'tree'); }
     } else { veh._touchTree = null; }
   }
 }
@@ -1344,7 +1360,9 @@ function buildFlags() {
   flags.length = 0;
   for (const c of camps) {
     if (c.role !== 'main') continue;
-    const hex = TEAM_ACCENT[c.team] || '#dddddd';
+    // Match the camp's live accent (team colour), so a player-chosen colour shows
+    // on the flag too — not a hard-coded red/blue. Recoloured on team-colour lock.
+    const hex = '#' + c.accent.getHexString();
     const g = new THREE.Group();
     const H = 8;
     const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, H, 6),
@@ -1355,9 +1373,18 @@ function buildFlags() {
     cloth.position.set(1.4, H - 1.1, 0); g.add(cloth);
     const gx = c.center.x, gz = c.center.z, gy = map.heightAt(gx, gz);
     g.position.set(gx, gy, gz);
+    // The HQ wears the flag on its roof; this capturable pole stays HIDDEN inside
+    // until the building is levelled — then it's revealed in the rubble and drops
+    // to the ground (see updateFlags) for a Firebrat to grab.
+    g.visible = false;
     scene.add(g);
-    flags.push({ team: c.team, group: g, cloth, home: { x: gx, y: gy, z: gz }, carried: false, carrier: null, returnT: 0 });
+    flags.push({ team: c.team, group: g, cloth, hqBody: c.flagHQ || null, revealed: false, dropT: 0,
+      home: { x: gx, y: gy, z: gz }, carried: false, carrier: null, returnT: 0 });
   }
+}
+// Tint a team's capturable flag to a chosen colour (player team-colour lock).
+function recolorFlag(team, hex) {
+  for (const f of flags) if (f.team === team) { f.cloth.material.color.set(hex); f.cloth.material.emissive.set(hex); }
 }
 // Nearest rival flag to `team`'s base (its steal target).
 function enemyFlagOf(team) {
@@ -1373,7 +1400,21 @@ function enemyFlagOf(team) {
 function updateFlags(dt) {
   if (matchOver) return;
   const GRAB = 6, CAP = 12, CAP_FOB = 16;   // FOB capture zone a touch wider (the deck)
+  const DROP_FROM = 12, DROP_DUR = 1.1;     // flag falls ~12u from the roofline over ~1.1s
   for (const f of flags) {
+    // The flag is sealed inside its HQ until the building is rubble. On the kill,
+    // reveal it and let it FALL from the roofline to the ground at the rubble.
+    if (!f.revealed) {
+      if (f.hqBody && f.hqBody.dead) {
+        f.revealed = true; f.group.visible = true; f.dropT = DROP_DUR;
+        showBanner(`${f.team.toUpperCase()} HQ DOWN — FLAG EXPOSED`, { color: '#ffd0a0' });
+      } else if (!f.carried) { continue; }   // still entombed and not in play — skip
+    }
+    if (f.dropT > 0 && !f.carried) {          // gravity-ish drop into the rubble
+      f.dropT = Math.max(0, f.dropT - dt);
+      const e = 1 - f.dropT / DROP_DUR;       // 0 (top) -> 1 (ground)
+      f.group.position.y = f.home.y + DROP_FROM * (1 - e * e);
+    }
     if (f.carried && f.carrier) {
       if (f.carrier.dead) {
         // Carrier killed (anywhere — including on the lift) → the flag drops where
@@ -1559,7 +1600,7 @@ function cellBlocked(v, i, j) {
   if (roadNet.cells && roadNet.cells.has(i + ',' + j)) return false;
   if (elevatorPadAt(x, z)) return false;
   const m = v._move;
-  if (m.water === 'sink' && !map.isLand(x, z)) return true;
+  if (m.water === 'sink' && map.isDeepWater(x, z)) return true;   // sinkers route around DEEP water; shallow is fordable
   if (!m.ignoreWalls) {
     const margin = VEH_R * 0.45;
     for (const o of obstacles) {
@@ -1651,6 +1692,7 @@ class AICommander {
     this.colorIndex = colorIndex;
     const accent = TEAM_COLORS[colorIndex].hex;
     for (const c of camps) if (c.team === this.team) c.setAccent(accent);
+    recolorFlag(this.team, accent);
     const elev = elevators.find(e => e.team === this.team); if (elev) elev.setAccent(accent);
     this.fortHp0 = fortHpOf(this.targetTeam()) || 1;
     this.targetTurrets0 = turretCountOf(this.targetTeam());   // baseline for tower-first ordering
@@ -1679,6 +1721,10 @@ class AICommander {
     const live = this.turretsLive();
     return live === 0 || live <= (this.targetTurrets0 || 0) * 0.34;
   }
+  // The enemy flag is sealed inside its HQ until that building is rubble. The
+  // runner can't grab it before then, so the heavy must finish the HQ first —
+  // strategy cards gate the open→grab handoff on this.
+  flagExposed() { const f = this.flag(); return !!(f && f.revealed); }
   // A point just outside the enemy base's lowest-HP wall — where to punch through.
   weakestApproach() {
     const tt = this.targetTeam(), base = this.enemyBasePos();
@@ -1769,6 +1815,17 @@ class AICommander {
   _logTick(v, view, cmd) {
     const fob = teamCenter(this.team, 'fob');
     const prev = this._dbg && this._dbg.state;
+    // Visible siege progress: shout when an enemy tower falls, and when the last one
+    // does (defenses clear → time to crack the HQ). Tracked on the commander so it
+    // survives unit deaths/swaps mid-siege.
+    const liveTowers = this.turretsLive();
+    if (this._lastTowers == null) this._lastTowers = liveTowers;
+    if (liveTowers < this._lastTowers) {
+      aiLog(this.team, liveTowers === 0
+        ? `${this.personality.name}: enemy towers CLEAR — breaching HQ`
+        : `${this.personality.name}: tower down — ${liveTowers} enemy towers left`);
+      this._lastTowers = liveTowers;
+    } else if (liveTowers > this._lastTowers) { this._lastTowers = liveTowers; }   // match reset
     this._dbg = {
       name: this.personality.name, type: v.type, state: cmd.state,
       card: (this.strategy.constructor.name || 'Card').replace('Strategy', ''),
@@ -1782,7 +1839,10 @@ class AICommander {
       let why = '';
       if (cmd.state === 'retreat') why = ` (hp ${Math.round(v.hp / v.maxHp * 100)}%)`;
       else if (cmd.state === 'resupply') why = v.ammo <= 0 ? ' (out of ammo)' : ` (fuel ${Math.round(v.fuel / v.maxFuel * 100)}%)`;
-      else if (cmd.state === 'suppress') why = view.threatLOS ? ' (shelling tower)' : ` (flanking ${view.flankSide > 0 ? 'left' : 'right'} of tower)`;
+      else if (cmd.state === 'suppress') {
+        const inPos = view.threatStand && Math.hypot(view.threatStand.x - v.holder.position.x, view.threatStand.z - v.holder.position.z) <= 6;
+        why = inPos ? ` (shelling tower — ${this.turretsLive()} left)` : ' (skirting to isolate a tower)';
+      }
       else if (cmd.state === 'engage') why = ' (enemy in sight)';
       else if (cmd.state === 'assault') why = ` (sieging, ${this.turretsLive()} towers left)`;
       aiLog(this.team, `${this.personality.name} ${v.type}: ${cmd.state}${why}`);
@@ -1913,7 +1973,7 @@ class AICommander {
     if (cmd.fire && v.cooldown <= 0) {
       let tp = null;
       if (cmd.state === 'suppress' && view.threat) tp = _aimDir.set(view.threat.x, view.threat.y, view.threat.z).clone();
-      else if (view.enemy) tp = _aimDir.set(view.enemy.x, v.holder.position.y, view.enemy.z).clone();
+      else if (view.enemy) tp = _aimDir.set(view.enemy.x, view.enemy.y, view.enemy.z).clone();
       fireVehicle(v, false, tp);
     }
   }
@@ -1926,7 +1986,7 @@ class AICommander {
       if (o.dead || o.team === this.team) continue;
       const d = (o.holder.position.x - px) ** 2 + (o.holder.position.z - pz) ** 2;
       if (d < best && (flyer || hasLOS(px, pz, o.holder.position.x, o.holder.position.z))) {
-        best = d; enemy = { x: o.holder.position.x, z: o.holder.position.z, type: o.type, shield: o.shield }; seen = o; seesEnemy = true;
+        best = d; enemy = { x: o.holder.position.x, y: o.holder.position.y, z: o.holder.position.z, type: o.type, shield: o.shield }; seen = o; seesEnemy = true;
       }
     }
     // Fog-of-war intel: remember what the enemy keeps fielding so counterVehicle() works.
@@ -1993,13 +2053,18 @@ class AICommander {
     // `threatLOS` lets the brain hold + fire when it can see the tower, or swing wide
     // to the flank (rather than hammer the wall in front of it) when it can't. The
     // cross product of (base→tower) × (tower→unit) picks the nearer side to arc to.
-    let flankSide = 0, threatLOS = false;
+    let flankSide = 0, threatLOS = false, threatStand = null;
     if (threat) {
       threatLOS = flyer || hasLOS(px, pz, threat.x, threat.z);
       if (threatCamp) {
         const bx = threat.x - threatCamp.center.x, bz = threat.z - threatCamp.center.z;
         const ux = px - threat.x, uz = pz - threat.z;
         flankSide = (bx * uz - bz * ux) >= 0 ? 1 : -1;
+        // The one-gun-at-a-time spot: radially OUTSIDE the base through this turret,
+        // at the type's hold range — far from the OTHER corner turrets' fire arcs.
+        const om = Math.hypot(bx, bz) || 1;
+        const hold = TURRET_HOLD[v.type] || (ENGAGE_RANGE[v.type] || 36) * 0.9;
+        threatStand = { x: threat.x + (bx / om) * hold, z: threat.z + (bz / om) * hold };
       }
     }
     const fx = -Math.sin(h), fz = -Math.cos(h), lx = -Math.sin(h + 0.6), lz = -Math.cos(h + 0.6),
@@ -2008,7 +2073,7 @@ class AICommander {
       dt,
       self: { x: px, z: pz, heading: h, type: v.type, shield: v.shield, hpFrac: v.hp / v.maxHp, fuelFrac: v.fuel / v.maxFuel, ammoFrac: v.ammo / v.maxAmmo },
       seesEnemy, enemy,
-      threat, threatLOS, flankSide, engageRange: ENGAGE_RANGE[v.type] || 36,
+      threat, threatLOS, flankSide, threatStand, engageRange: ENGAGE_RANGE[v.type] || 36,
       goal: mustGo ? this._exit : goal,
       mustGo,
       resupply: supply ? { x: supply.center.x, z: supply.center.z } : goal,
@@ -2263,6 +2328,7 @@ function deployToFOB(type, colorIndex, rise) {
   playerColorIndex = colorIndex;   // tints this vehicle's projectiles
   const accent = TEAM_COLORS[colorIndex].hex;
   for (const c of camps) if (c.team === PLAYER_TEAM) c.setAccent(accent);
+  recolorFlag(PLAYER_TEAM, accent);
   playerElev = elevators.find(e => e.team === PLAYER_TEAM) || null;
   const cx = playerElev ? playerElev.center.x : 0;
   const cz = playerElev ? playerElev.center.z : 0;
@@ -2843,6 +2909,7 @@ window.RR = {
   get flags() { return flags; },
   get teamCtrl() { return TEAM_CTRL; },
   damageVehicle: (v, amt) => damageVehicle(v || player, amt),
+  get damageTally() { return { ...dmgTally }; },
   explodeAt: (x, y, z, blast = 4, dmg = 100) => explodeAt(new THREE.Vector3(x, y, z), blast, dmg, null, null),
   // Headless test hook: run one combat sim step (projectile flight + hits + fx).
   tickCombat: (dt = 0.05) => { projectiles.update(dt); updateProjectileHits(); if (foliage) foliage.update(dt); updateFx(dt); },
