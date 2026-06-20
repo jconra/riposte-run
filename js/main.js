@@ -16,7 +16,7 @@ import { Garage, GARAGE_COUNTS } from './Garage.js';
 import { TEAM_COLORS, updateCamo, camoParams } from '../../vehicle-designer/js/CamoTexture.js';
 import { SoundManager } from '../../vehicle-designer/js/SoundManager.js';
 import { Projectiles } from '../../vehicle-designer/js/Projectiles.js';
-import { Brain, randomPersonality } from './AI.js?v=57';
+import { Brain, randomPersonality } from './AI.js?v=63';
 import { drawStrategy, makeDoctrine, pickArchetype, assignArchetypes, COUNTER } from './AIStrategies.js?v=57';
 import { ExploreMemory } from './ExploreMemory.js?v=54';
 import { astarGrid } from './astar.js';
@@ -596,6 +596,15 @@ projectiles.missileScale = 3.4;   // Valkyrie missiles read tiny against the big
 const FIRE_INTERVALS = [0.32, 0.11, 1.05, 1.7];   // by soundIndex: Lurcher, Firebrat, Valkyrie, Jotun
 const SHOT_DMG       = [35, 14, 90, 180];          // damage per hit
 const SHOT_BLAST     = [1.2, 0.6, 4.5, 5.5];       // splash radius (laser/tracer tiny, missile/rail big)
+// Effective projectile speed (u/s) for AI aim-leading, by soundIndex. Firebrat (1) is
+// hitscan and Jotun (3) has a charge delay — both 0 (no lead). The missile (2)
+// accelerates; ~32 is roughly its average speed over a typical flight.
+const PROJ_SPEED     = [85, 0, 32, 0];
+// AI aim-leading strength: fraction of the predicted lead actually applied. Kept BELOW
+// 1 on purpose — a perfect intercept gives a fleeing target no way out; this leads
+// enough to connect on a straight runner but leaves room to juke (Jacob: "better, not
+// perfect"). Per-shot personality jitter loosens it further.
+const AIM_LEAD       = 0.7;
 // How far off the hull's forward a vehicle can aim a shot — the half-angle of the
 // firing cone. A reticle only appears (and a shot is valid) inside it. Per the
 // design: the Firebrat is a fixed forward gun (tiny 5° cone), the Jotun's heavy
@@ -763,6 +772,41 @@ function removeCombatant(veh) {
 
 // Fire a vehicle's gun: sound (player only), muzzle flash + recoil, and a damaging
 // projectile aimed down the gun/turret. cause-checked discharge for the railgun.
+// Stamp each combatant's planar velocity (u/s) once per frame from its movement, so
+// AI gunners can lead a moving target. Lightly smoothed so one jittery frame doesn't
+// throw the aim off; the values are read a frame later, which is plenty fresh.
+function trackVelocities(dt) {
+  if (dt <= 0) return;
+  for (const v of combatants) {
+    const x = v.holder.position.x, z = v.holder.position.z;
+    if (v._velPx != null) {
+      const ax = (x - v._velPx) / dt, az = (z - v._velPz) / dt;
+      v._vx = (v._vx || 0) * 0.6 + ax * 0.4;
+      v._vz = (v._vz || 0) * 0.6 + az * 0.4;
+    }
+    v._velPx = x; v._velPz = z;
+  }
+}
+
+// Predict where to aim so a shot meets a moving target. Solves the intercept time from
+// the projectile's speed (a couple of iterations), then applies only AIM_LEAD of the
+// predicted offset (plus the gunner's aim jitter) — good enough to punish a straight
+// runner, loose enough to dodge. Hitscan / charge weapons (PROJ_SPEED 0) and stationary
+// targets just aim at the current position. Returns a shared Vector3 — clone if kept.
+const _leadV = new THREE.Vector3();
+function leadAim(shooterPos, enemy, soundIndex, jitter = 0) {
+  const sp = PROJ_SPEED[soundIndex] || 0;
+  const vx = enemy.vx || 0, vz = enemy.vz || 0;
+  if (sp <= 0 || (vx === 0 && vz === 0)) return _leadV.set(enemy.x, enemy.y, enemy.z);
+  let t = 0;
+  for (let i = 0; i < 4; i++) {
+    const ex = enemy.x + vx * t, ez = enemy.z + vz * t;
+    t = Math.hypot(ex - shooterPos.x, ez - shooterPos.z) / sp;
+  }
+  const lead = AIM_LEAD * (1 + (Math.random() - 0.5) * jitter);
+  return _leadV.set(enemy.x + vx * t * lead, enemy.y, enemy.z + vz * t * lead);
+}
+
 function fireVehicle(veh, playSound, targetPoint = null, targetVeh = null) {
   if (!veh || veh.dead) return;
   if (veh.ammo <= 0) { if (veh.isPlayer) updatePlayerHud(); return; }   // dry — rearm at a depot/base
@@ -1465,9 +1509,9 @@ function updateFlags(dt) {
         if (v.team === f.team) {
           // Own team reaching its DISPLACED flag recovers it — snaps straight home
           // (you can't carry your own flag; this denies the thief a re-grab).
-          if (displaced) { f.group.position.set(f.home.x, f.home.y, f.home.z); showBanner(`${f.team.toUpperCase()} FLAG RECOVERED`, { color: '#9bd6ff' }); }
+          if (displaced) { f.group.position.set(f.home.x, f.home.y, f.home.z); showBanner(`${flagColorName(f)} FLAG RECOVERED`, { color: '#9bd6ff' }); }
         } else {
-          f.carried = true; f.carrier = v; showBanner(`${f.team.toUpperCase()} FLAG TAKEN`);
+          f.carried = true; f.carrier = v; showBanner(`${flagColorName(f)} FLAG TAKEN`, { color: '#' + f.cloth.material.color.getHexString() });
         }
         break;
       }
@@ -1951,6 +1995,7 @@ class AICommander {
   // straight. Falls back to the brain's seek when there's no route.
   _navOverride(v, view, cmd, dt) {
     if (v._move.ignoreWalls) return;
+    if (cmd.breakAim) return;     // brain is squaring up to shoot a blocker — don't steer it around
     const st = cmd.state;
     let dest = null, slack = 9;
     if (st === 'exit') { dest = this._exit || this.strategy.objective(this); slack = 5; }   // thread the gate via A*
@@ -2068,12 +2113,19 @@ class AICommander {
     decayAim(v, dt);
     if (v.dead) { this.unit = null; this.respawnT = 4; this._rising = false; return; }
     v.cooldown -= dt;
-    // Fire at the current target: a suppressed wall-turret (aimed at its raised head
-    // so the slug arcs up), else the spotted rival, else straight ahead.
+    // Fire at the current target: a suppressed wall-turret (aimed at its raised head so
+    // the slug arcs up). With NO clean line to it (a wall/HQ blocks the shot) a siege
+    // unit aims LOW instead — at the obstruction — so the shell demolishes a path through
+    // rather than arcing uselessly over the wall at a turret it can't reach.
     if (cmd.fire && v.cooldown <= 0) {
       let tp = null;
-      if (cmd.state === 'suppress' && view.threat) tp = _aimDir.set(view.threat.x, view.threat.y, view.threat.z).clone();
-      else if (view.enemy) tp = _aimDir.set(view.enemy.x, view.enemy.y, view.enemy.z).clone();
+      if (cmd.state === 'suppress' && view.threat) {
+        tp = (!view.threatLOS && view.demolishTarget)
+          ? _aimDir.set(view.demolishTarget.x, view.demolishTarget.y, view.demolishTarget.z).clone()
+          : _aimDir.set(view.threat.x, view.threat.y, view.threat.z).clone();
+      }
+      else if (view.enemy) tp = leadAim(v.holder.position, view.enemy, v.def.soundIndex, v.ai.p.jitter).clone();   // lead a moving target (Lurcher/Valkyrie)
+      else if (cmd.breakAim) tp = _aimDir.set(cmd.breakAim.x, cmd.breakAim.y, cmd.breakAim.z).clone();   // blasting a blocker out of the way
       fireVehicle(v, false, tp);
     }
   }
@@ -2087,7 +2139,7 @@ class AICommander {
       if (o.dead || o.team === this.team) continue;
       const d = (o.holder.position.x - px) ** 2 + (o.holder.position.z - pz) ** 2;
       if (d < best && (flyer || hasLOS(px, pz, o.holder.position.x, o.holder.position.z))) {
-        best = d; enemy = { x: o.holder.position.x, y: o.holder.position.y, z: o.holder.position.z, type: o.type, shield: o.shield }; seen = o; seesEnemy = true;
+        best = d; enemy = { x: o.holder.position.x, y: o.holder.position.y, z: o.holder.position.z, type: o.type, shield: o.shield, vx: o._vx || 0, vz: o._vz || 0 }; seen = o; seesEnemy = true;
       }
     }
     // Fog-of-war intel: remember what the enemy keeps fielding so counterVehicle() works.
@@ -2176,19 +2228,56 @@ class AICommander {
         threatStand = { x: threat.x + (bx / om) * hold, z: threat.z + (bz / om) * hold };
       }
     }
+    // SIEGE FLATTEN: with no clean line on the tower, a siege unit demolishes the nearest
+    // enemy WALL in its way (a real, solidly-hittable target at its true position) to blow
+    // a path through to the far side — aimed shots at the hidden turret just arc over.
+    let demolishTarget = null;
+    if (threat && !threatLOS && threatCamp) {
+      let bestW = Infinity;
+      for (const w of threatCamp.walls) {
+        if (!w.body || w.body.dead) continue;
+        const wx = w.group.position.x, wz = w.group.position.z;
+        const d = (wx - px) ** 2 + (wz - pz) ** 2;
+        if (d < bestW) { bestW = d; demolishTarget = { x: wx, y: map.heightAt(wx, wz) + 2.5, z: wz }; }
+      }
+    }
     const fx = -Math.sin(h), fz = -Math.cos(h), lx = -Math.sin(h + 0.6), lz = -Math.cos(h + 0.6),
           rx = -Math.sin(h - 0.6), rz = -Math.cos(h - 0.6), P = 9;
+    const blockedAhead = v._blocked(px + fx * P, pz + fz * P);
+    // BREAK-THROUGH: when the nose is blocked, find the destructible dead ahead (the
+    // nearest enemy/neutral WALL in front, else a TREE on the path) so a stuck ground
+    // unit can shoot it out of the way instead of circling. Only the obstacles that
+    // actually block are walls and trees — both take fire — so anything found here is a
+    // valid target; water / world-edge leave it null and the unit dodges as before.
+    let breakTarget = null;
+    if (!flyer && blockedAhead) {
+      const reach = 16;
+      let best = null, bestD = reach * reach, ty = 2.0;
+      for (const o of obstacles) {
+        const ox = o.x - px, oz = o.z - pz;
+        if (ox * fx + oz * fz <= 0) continue;          // behind the nose
+        const d = ox * ox + oz * oz;
+        if (d < bestD) { bestD = d; best = o; ty = 2.0; }
+      }
+      if (foliage) {
+        for (let s = VEH_R; s <= reach; s += 2.5) {     // walk the forward ray for a palm
+          const t = foliage.treeAt(px + fx * s, pz + fz * s, VEH_R);
+          if (t) { const d = (t.x - px) ** 2 + (t.z - pz) ** 2; if (!best || d < bestD) { best = t; ty = 3.0; } break; }
+        }
+      }
+      if (best) breakTarget = { x: best.x, y: map.heightAt(best.x, best.z) + ty, z: best.z };
+    }
     return {
       dt,
       self: { x: px, z: pz, heading: h, type: v.type, shield: v.shield, hpFrac: v.hp / v.maxHp, fuelFrac: v.fuel / v.maxFuel, ammoFrac: v.ammo / v.maxAmmo },
       seesEnemy, enemy, flyer, shotArc: SHOT_ARC[v.type] ?? Math.PI / 5,
-      threat, threatLOS, flankSide, threatStand, engageRange: ENGAGE_RANGE[v.type] || 36,
+      threat, threatLOS, flankSide, threatStand, demolishTarget, breakTarget, engageRange: ENGAGE_RANGE[v.type] || 36,
       goal: mustGo ? this._exit : goal,
       mustGo,
       resupply: supply ? { x: supply.center.x, z: supply.center.z } : goal,
       home: healHome || goal,
       shootGoal: this.strategy.shoot(this), arriveDist: this.strategy.arriveDist(this),
-      blockedAhead: v._blocked(px + fx * P, pz + fz * P),
+      blockedAhead,
       blockedLeft: v._blocked(px + lx * P, pz + lz * P),
       blockedRight: v._blocked(px + rx * P, pz + rz * P),
     };
@@ -2252,6 +2341,20 @@ function teamColor(team) {
   const cmd = commanders.find(c => c.team === team && c.colorIndex != null);
   return cmd && TEAM_COLORS[cmd.colorIndex] ? TEAM_COLORS[cmd.colorIndex].hex : '#ffffff';
 }
+// Name flag messages after the flag's ACTUAL colour, not its internal team id —
+// a team painted SNOW shouldn't read "RED FLAG TAKEN". Nearest palette swatch by
+// RGB distance (tolerates emissive/recolour drift).
+function colorName(hex) {
+  const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+  let best = 'FLAG', bestD = Infinity;
+  for (const c of TEAM_COLORS) {
+    const cr = parseInt(c.hex.slice(1, 3), 16), cg = parseInt(c.hex.slice(3, 5), 16), cb = parseInt(c.hex.slice(5, 7), 16);
+    const d = (r - cr) ** 2 + (g - cg) ** 2 + (b - cb) ** 2;
+    if (d < bestD) { bestD = d; best = c.name; }
+  }
+  return best;
+}
+function flagColorName(f) { return colorName('#' + f.cloth.material.color.getHexString()); }
 function ensureCelebStyle() {
   if (document.getElementById('celeb-style')) return;
   const s = document.createElement('style'); s.id = 'celeb-style';
@@ -3125,6 +3228,7 @@ function animate() {
     if (garage.phase === 'done') enterField();
   } else {
     if (!driveUpdate(dt)) spectateUpdate(dt) || panUpdate(dt);   // player, else follow the action / free cam
+    trackVelocities(dt);                   // per-vehicle velocity for AI aim-leading
     if (!matchOver) updateCommanders(dt);  // AI teams (fog-of-war) + flag carry/capture — frozen on win
     for (const c of camps) c.update(dt);
     for (const e of elevators) e.update(dt);

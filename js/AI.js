@@ -41,6 +41,10 @@ export function randomPersonality(rng = Math.random) {
     wanderlust: 0.35 + rng() * 0.65,
     reaction: 0.15 + rng() * 0.5,        // decision lag (seconds)
     jitter: 0.1 + rng() * 0.4,           // aim/steer noise
+    // How readily this brain shoots a destructible obstacle out of its way instead of
+    // driving around it. High = trigger-happy: blasts trees/walls on contact and burns
+    // ammo (then has to peel off and reload); low = patient: tries to skirt first.
+    triggerHappy: clamp01(0.15 + rng() * 0.85),
     pref: TYPES[(rng() * TYPES.length) | 0],
     name: CALLSIGNS[(rng() * CALLSIGNS.length) | 0],
   };
@@ -158,15 +162,31 @@ const BEHAVIORS = {
       // Fire whenever the turret can bear on the tower (target inside the arc) and it's
       // in range with a clear line — independent of where the hull is pointed.
       const arc = Math.min(view.shotArc || 0.26, Math.PI * 0.55);
-      const canBear = view.threatLOS && Math.abs(err) < arc && dist < want * 1.3;
-      const fire = canBear ? mem.rng() < (0.7 + p.aggression * 0.3) * AI_HANDICAP.fireProb : false;
+      const aimed = Math.abs(err) < arc && dist < want * 1.3;
+      const canBear = view.threatLOS && aimed;
+      // SIEGE FLATTEN: a ground unit with NO clean line on the tower (a wall/HQ blocks
+      // it) doesn't circle forever hunting an angle — it PLANTS, squares onto the nearest
+      // WALL in the way, and blasts a path through, so it levels the far side too.
+      // Gate on the WALL's range, not the (possibly far) turret's — the obstruction is
+      // right in front even when the tower behind it is way out of reach. (Flyers skip
+      // this: a Valkyrie clears walls and shoots over them.)
+      let demolish = false, demoErr = 0, demoAimed = false;
+      if (!view.flyer && !view.threatLOS && view.demolishTarget) {
+        const ddx = view.demolishTarget.x - self.x, ddz = view.demolishTarget.z - self.z;
+        if (Math.hypot(ddx, ddz) < want * 1.3) {
+          demolish = true;
+          demoErr = wrapPi(Math.atan2(-ddx, -ddz) - self.heading);   // hull-relative bearing to the wall
+          demoAimed = Math.abs(demoErr) < arc;
+        }
+      }
+      const fire = (canBear || (demolish && demoAimed)) ? mem.rng() < (0.7 + p.aggression * 0.3) * AI_HANDICAP.fireProb : false;
       // A ground unit can be physically barred from the standoff (water / coast / a
       // wall it must blow through first). If it's wedged on the way, stop trying to
       // skirt — square up and pour fire into whatever it can see (this fallback is
       // what the earlier "march to the standoff cold" attempt lacked).
       const barred = !view.flyer && mem._stillT > 0.5;
-      if (atStand || barred) {
-        const turn = clamp(err * 2.2, -1, 1);              // square the nose onto the tower
+      if (atStand || barred || demolish) {
+        const turn = clamp((demolish ? demoErr : err) * 2.2, -1, 1);   // square onto the wall (demolish) or tower
         const fwd = dist > want ? 0.4 : 0;                 // ease into range, then plant
         mem._wantMove = fwd > 0.3;
         return { fwd, turn, fire, state: mode };
@@ -243,7 +263,28 @@ const BEHAVIORS = {
   // never gag the weapons: a blocked unit can still fire at whatever's in front of it.
   // True wedges (driving but not moving) are still caught by the unstick reflex.
   avoid(ctx, cmd) {
-    const { view, mem, cfg } = ctx;
+    const { view, mem, cfg, p } = ctx;
+    // SHOOT-THROUGH: a destructible (wall or tree) is dead ahead on the way to the goal.
+    // Rather than always circling it, a brain can square the nose onto it and blast a
+    // path clear — a Firebrat that can't crush a palm just shoots it down; a heavy
+    // levels a wall. How eagerly is the triggerHappy knob: a trigger-happy brain fires
+    // almost on contact (and spends ammo, so it has to reload later), a patient one
+    // tries to skirt for a beat first and only shoots if it's still wedged. Combat
+    // states keep their own targeting (the siege-flatten in `combat`), so skip those.
+    const hasAmmo = view.self.ammoFrac == null || view.self.ammoFrac > 0;
+    const canBreak = hasAmmo && view.breakTarget && view.blockedAhead && cmd.state !== 'engage' && cmd.state !== 'suppress';
+    if (canBreak) {
+      mem._breakT = (mem._breakT || 0) + view.dt;
+      const patience = (1 - (p.triggerHappy ?? 0.5)) * cfg.breakPatience;   // eager → ~0s, patient → full
+      if (mem._breakT > patience) {
+        const bt = view.breakTarget, s = view.self;
+        const berr = wrapPi(Math.atan2(-(bt.x - s.x), -(bt.z - s.z)) - s.heading);
+        mem._wantMove = true;
+        return { fwd: 0.3, turn: clamp(berr * 2.4, -1, 1), fire: true, state: cmd.state, breakAim: bt };
+      }
+    } else {
+      mem._breakT = 0;
+    }
     if (view.blockedAhead) {
       mem._dodgeClearT = 0;
       if (!mem._dodgeTurn) {                       // choose a way around ONCE, then commit
@@ -280,6 +321,7 @@ export const DEFAULT_BRAIN = {
     unstickRev: 0.7,     // reverse throttle during the jolt
     dodgeClear: 0.6,     // seconds the path must stay clear before forgetting which way we were going round
     dodgeFlip: 3.0,      // seconds stuck circling one way before flipping to the other (escape a trap)
+    breakPatience: 2.4,  // max seconds a PATIENT brain skirts a destructible before it gives up and shoots it (triggerHappy scales this down toward 0)
     exitAlign: 0.30,     // |heading error| under which the exit state drives straight
     exitTurnGain: 2.2,   // steer gain while lining up on the gate
     bailBase: 0.45,      // hp pull-out threshold = bailBase - aggression*bailAggr
