@@ -12,7 +12,7 @@ import { RoadNetwork } from './Roads.js';
 import { Foliage } from './Foliage.js';
 import { Vehicle, VEHICLE_TYPES } from './Vehicles.js';
 import { Elevator } from './Elevator.js';
-import { Garage } from './Garage.js';
+import { Garage, GARAGE_COUNTS } from './Garage.js';
 import { TEAM_COLORS, updateCamo, camoParams } from '../../vehicle-designer/js/CamoTexture.js';
 import { SoundManager } from '../../vehicle-designer/js/SoundManager.js';
 import { Projectiles } from '../../vehicle-designer/js/Projectiles.js';
@@ -427,6 +427,9 @@ const TEAM_CAMO   = { red: 4, blue: 5 };
 // Default vehicle each team fields (used for the plain-field player until a real
 // garage deploy chooses one).
 const FOB_RIDER = { red: 'jotun', blue: 'firebrat' };
+// Role classes for roster substitution: when the wanted vehicle is used up, the
+// commander falls back to one in the same weight class before resorting to anything.
+const HEAVY_TYPES = ['jotun', 'lurcher'], FAST_TYPES = ['firebrat', 'valkyrie'];
 const PLAYER_TEAM = 'red';   // the garage / player's side
 // Who runs each team: 'human' (player drive/garage) or 'ai' (an AICommander).
 // Flexible by design — flip any team to 'ai' for AI-vs-AI, or extend for more
@@ -1680,6 +1683,8 @@ class AICommander {
     this.knownSupplies = new Set();                   // fog-of-war: resupply POIs this team has SCOUTED
     this.explore = new ExploreMemory(map.worldW, map.worldH);   // coarse "where have we looked" grid
     this._exploreWp = null;                           // current recon waypoint (held until reached)
+    this.roster = { ...GARAGE_COUNTS };               // finite fleet, same numbers as the player's garage; a death removes one
+    this._eliminated = false;                         // true once the roster is empty (no more vehicles to field)
     this._rising = false; this._elev = null;          // FOB-lift deploy state
     this._exit = null; this._exitT = 0;               // post-deploy "drive out through the gate" waypoint
     this._nav = { path: null, idx: 0, t: 0, dx: null, dz: null };   // A* path cache
@@ -1746,7 +1751,23 @@ class AICommander {
   counterVehicle() {
     let topType = null, topN = 0;
     for (const k in this.seenTypes) if (this.seenTypes[k] > topN) { topN = this.seenTypes[k]; topType = k; }
-    return (topType && COUNTER[topType]) || 'lurcher';
+    // Don't ask for a counter we've run out of — fall back to one we still have.
+    const c = (topType && COUNTER[topType]) || 'lurcher';
+    return (this.roster[c] || 0) > 0 ? c : (this._pickAvailableType(c) || c);
+  }
+  // Total vehicles this commander has left to field (the fielded unit still counts).
+  fleetLeft() { let n = 0; for (const k in this.roster) n += this.roster[k]; return n; }
+  // The type to actually field: the wanted one if any remain, else a same-class
+  // substitute, else whatever we have most of, else null (roster empty → eliminated).
+  _pickAvailableType(want) {
+    if ((this.roster[want] || 0) > 0) return want;
+    const cls = HEAVY_TYPES.includes(want) ? HEAVY_TYPES : FAST_TYPES;
+    const sameClass = cls.filter(t => (this.roster[t] || 0) > 0);
+    if (sameClass.length) return sameClass[0];
+    const any = Object.keys(this.roster).filter(t => (this.roster[t] || 0) > 0);
+    if (!any.length) return null;
+    any.sort((a, b) => this.roster[b] - this.roster[a]);   // prefer the type we have most of
+    return any[0];
   }
   // A recon waypoint into unexplored map, held until the unit reaches it, then advanced
   // to the next — so a scout sweeps the island outward instead of beelining the base.
@@ -1767,10 +1788,17 @@ class AICommander {
   redraw() { this.strategy = drawStrategy(this.personality, Math.random, this.strategy.constructor); this.fortHp0 = fortHpOf(this.targetTeam()) || this.fortHp0; this.targetTurrets0 = turretCountOf(this.targetTeam()); this.failStreak = 0; aiLog(this.team, `${this.personality.name} draws ${(this.strategy.constructor.name || 'card').replace('Strategy', '')} (new plan)`); }
 
   deploy() {
-    const type = this.strategy.wantVehicle(this);
+    const want = this.strategy.wantVehicle(this);
+    const type = this._pickAvailableType(want);
+    if (!type) {                               // roster empty — this commander is out of the fight
+      this.unit = null;
+      if (!this._eliminated) { this._eliminated = true; aiLog(this.team, `${this.personality.name} has no vehicles left`); }
+      return;
+    }
     this._stepAtDeploy = this.strategy.step;   // lock the type for this step — no mid-step churn
     this._recalling = false;
-    aiLog(this.team, `${this.personality.name} deploys ${type}`);
+    const sub = type !== want ? ` (out of ${want})` : '';
+    aiLog(this.team, `${this.personality.name} deploys ${type}${sub} — ${this.fleetLeft()} left`);
     const home = this.homePos();
     const v = new Vehicle(type); v.setScale(0.72);
     v.setCamo(this.colorIndex); v.setTeamColor(TEAM_COLORS[this.colorIndex].hex);
@@ -1957,6 +1985,8 @@ class AICommander {
       if (this.unit && this.unit.dead) {
         this.deaths++;
         this.failStreak = (this.failStreak || 0) + 1;
+        const lost = this.unit.type;                 // attrition: that vehicle is gone from the roster
+        if (this.roster[lost] != null) this.roster[lost] = Math.max(0, this.roster[lost] - 1);
         // A runner died storming the base → the approach isn't safe yet. Go BACK to
         // softening (send a heavy to finish the towers) instead of feeding another
         // Firebrat into the exact same death.
@@ -1971,7 +2001,7 @@ class AICommander {
       this.unit = null;
       this._rising = false; this._recalling = false;
       this.respawnT -= dt;
-      if (this.started && this.respawnT <= 0) { this.respawnT = 4 + Math.random() * 3; this.deploy(); }
+      if (this.started && !this._eliminated && this.respawnT <= 0) { this.respawnT = 4 + Math.random() * 3; this.deploy(); }
       return;
     }
     // Still riding the FOB lift up? Hold (no driving/firing) until it tops, then
@@ -2929,6 +2959,7 @@ window.RR = {
   get aiEvents() { return aiEvents.slice(); },                 // debug: the rolling AI decision log (headless can't read the DOM overlay)
   exploreFrac: (i = 0) => { const c = commanders[i]; return c && c.explore ? c.explore.fraction() : null; },   // debug: fraction of map this team has scouted
   exploreWp: (i = 0) => { const c = commanders[i]; return c ? c._exploreWp : null; },                          // debug: current recon waypoint
+  aiRoster: (i = 0) => { const c = commanders[i]; return c ? { roster: { ...c.roster }, left: c.fleetLeft(), eliminated: c._eliminated } : null; },   // debug: remaining fleet
   // Fast-forward the field sim by fixed steps (headless verification runs ~0.2x
   // real-time, so this advances GAME time without waiting on the slow renderer).
   stepField: (dt = 0.05, n = 1) => {
