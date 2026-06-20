@@ -16,8 +16,8 @@ import { Garage, GARAGE_COUNTS } from './Garage.js';
 import { TEAM_COLORS, updateCamo, camoParams } from '../../vehicle-designer/js/CamoTexture.js';
 import { SoundManager } from '../../vehicle-designer/js/SoundManager.js';
 import { Projectiles } from '../../vehicle-designer/js/Projectiles.js';
-import { Brain, randomPersonality } from './AI.js?v=54';
-import { drawStrategy, COUNTER } from './AIStrategies.js?v=54';
+import { Brain, randomPersonality } from './AI.js?v=55';
+import { drawStrategy, makeDoctrine, pickArchetype, COUNTER } from './AIStrategies.js?v=55';
 import { ExploreMemory } from './ExploreMemory.js?v=54';
 import { astarGrid } from './astar.js';
 import { makeFuelTank, makeAmmoDepot, makeShieldGenerator, makeShieldBubble, RESUPPLY_TINT } from './Resupply.js';
@@ -788,7 +788,7 @@ function fireVehicle(veh, playSound, targetPoint = null, targetVeh = null) {
     if (guaranteed) {
       // Land the damage directly on the locked target; the slug is just a visual.
       const dist = targetVeh.holder.position.distanceTo(mpos);
-      damageVehicle(targetVeh, SHOT_DMG[idx] * rangeFalloff(veh.type, dist), 'vehicle');
+      damageVehicle(targetVeh, SHOT_DMG[idx] * rangeFalloff(veh.type, dist), 'vehicle', veh);
       projectiles.spawn(idx, mpos, dir, hex);   // no dmg payload → updateProjectileHits ignores it
     } else if (idx === 1) {
       // Firebrat laser = hitscan: damage the first thing along the beam now.
@@ -1024,14 +1024,14 @@ function damageVehiclesAt(point, blast, dmg, team, shooter) {
     if (v.dead || v === shooter) continue;
     if (team != null && v.team === team) continue;
     const reach = blast + v.hitR;
-    if (v.holder.position.distanceToSquared(point) <= reach * reach) damageVehicle(v, dmg, 'vehicle');
+    if (v.holder.position.distanceToSquared(point) <= reach * reach) damageVehicle(v, dmg, 'vehicle', shooter);
   }
 }
 
 // Running tally of damage dealt to vehicles, by source — powers siege diagnostics
 // (are attackers dying to towers or to enemy vehicles?) and a future kill feed.
 const dmgTally = { turret: 0, vehicle: 0, tree: 0, other: 0 };
-function damageVehicle(veh, amount, cause = 'other') {
+function damageVehicle(veh, amount, cause = 'other', shooter = null) {
   if (veh.dead) return;
   dmgTally[cause] = (dmgTally[cause] || 0) + amount;
   if (veh.ai) veh._dmgBy = veh._dmgBy || { turret: 0, vehicle: 0, tree: 0, other: 0 }, veh._dmgBy[cause] += amount;
@@ -1046,7 +1046,7 @@ function damageVehicle(veh, amount, cause = 'other') {
   if (amount > 0) veh.hp -= amount;
   if (veh.bar) updateHealthBar(veh);
   if (veh.isPlayer) updatePlayerHud();
-  if (veh.hp <= 0) destroyVehicle(veh, 'killed');
+  if (veh.hp <= 0) destroyVehicle(veh, 'killed', shooter);
 }
 
 // March a hitscan beam; damage the first solid/tree/vehicle it meets.
@@ -1058,7 +1058,7 @@ function raycastDamage(origin, dir, maxDist, dmg, blast, team, shooter) {
     if (hv) {
       // Hit the DETECTED vehicle directly — the detection pad (2.5) is wider than
       // the tiny splash reach, so a point-blast here would miss what the beam met.
-      damageVehicle(hv, dmg, 'vehicle');
+      damageVehicle(hv, dmg, 'vehicle', shooter);
       spawnImpact(hv.holder.position, blast);
       return;
     }
@@ -1177,10 +1177,21 @@ function updateFx(dt) {
 }
 
 // Destroy a vehicle: explosion, then remove it (or send the player to the garage).
-function destroyVehicle(veh, cause) {
+// Credit a kill to the firing unit's commander (ignores self/team kills, environment
+// deaths where there's no killer, and the player who has no commander). Powers the
+// "after a couple kills" doctrine transitions and a short kill-feed line.
+function creditKill(killer, victim) {
+  if (!killer || killer.team == null || killer.team === victim.team) return;
+  const cmd = commanders.find(c => c.team === killer.team);
+  if (!cmd) return;
+  cmd.kills = (cmd.kills || 0) + 1;
+  aiLog(killer.team, `${cmd.personality.name} ${killer.type} downs a ${victim.type} (${cmd.kills} kills)`);
+}
+function destroyVehicle(veh, cause, killer = null) {
   if (veh.dead) return;
   veh.dead = true;
   spawnExplosion(veh.holder.position, veh.type === 'jotun');
+  creditKill(killer, veh);   // credit the firing unit's commander (drives Warrior/Hunter doctrine + kill feed)
   if (veh.isPlayer) { killPlayer(); return; }
   // Surface what happened to the AI unit — drowned/destroyed units used to just vanish.
   if (veh.ai && veh.team) {
@@ -1672,12 +1683,14 @@ class AICommander {
   constructor(team) {
     this.team = team;
     this.personality = randomPersonality();
+    this.archetype = pickArchetype(Math.random);      // named doctrine (Warrior/...) — drives the whole plan
     this.colorIndex = null;
     this.started = false;
     this.unit = null;
     this.respawnT = 0;
     this.deaths = 0;
-    this.strategy = drawStrategy(this.personality);   // current "card" from the deck
+    this.kills = 0;                                   // enemy vehicles this commander's units have downed
+    this.strategy = makeDoctrine(this.archetype, this.personality);   // the archetype's plan (or a deck card)
     this.fortHp0 = null;                              // enemy fort HP when this card started
     this.seenTypes = {};                              // rival vehicle types this team has spotted
     this.knownSupplies = new Set();                   // fog-of-war: resupply POIs this team has SCOUTED
@@ -1719,6 +1732,7 @@ class AICommander {
     return t;
   }
   enemyBasePos() { return teamCenter(this.targetTeam(), 'main'); }
+  enemyFobPos() { return teamCenter(this.targetTeam(), 'fob'); }   // where the enemy's units rise — the Warrior hunts here
   flag() { return enemyFlagOf(this.team); }
   fortFrac() { return this.fortHp0 ? fortHpOf(this.targetTeam()) / this.fortHp0 : 1; }
   turretsLive() { return turretCountOf(this.targetTeam()); }
@@ -1785,7 +1799,7 @@ class AICommander {
   }
 
   // Draw a fresh card (on repeated losses / stalls) — keeps the AI unpredictable.
-  redraw() { this.strategy = drawStrategy(this.personality, Math.random, this.strategy.constructor); this.fortHp0 = fortHpOf(this.targetTeam()) || this.fortHp0; this.targetTurrets0 = turretCountOf(this.targetTeam()); this.failStreak = 0; aiLog(this.team, `${this.personality.name} draws ${(this.strategy.constructor.name || 'card').replace('Strategy', '')} (new plan)`); }
+  redraw() { this.strategy = makeDoctrine(this.archetype, this.personality, Math.random, this.strategy.constructor); this.fortHp0 = fortHpOf(this.targetTeam()) || this.fortHp0; this.targetTurrets0 = turretCountOf(this.targetTeam()); this.failStreak = 0; aiLog(this.team, `${this.personality.name} ${this.archetype ? 'regroups' : 'draws ' + (this.strategy.constructor.name || 'card').replace('Strategy', '')} (new plan)`); }
 
   deploy() {
     const want = this.strategy.wantVehicle(this);
@@ -1991,12 +2005,14 @@ class AICommander {
         // softening (send a heavy to finish the towers) instead of feeding another
         // Firebrat into the exact same death.
         if (this.unit.type === 'firebrat' && this.strategy.step === 'grab') {
-          this.strategy.step = 'open'; this.strategy.t = 0;
+          this.strategy.step = this.strategy.softenStep(); this.strategy.t = 0;
           this.targetTurrets0 = turretCountOf(this.targetTeam());
           aiLog(this.team, `${this.personality.name} runner down — re-softening (towers still up)`);
         }
-        // Keep losing the same way? Each repeat raises the odds of a brand-new plan.
-        if (Math.random() < Math.min(0.85, 0.25 + this.failStreak * 0.2)) this.redraw();
+        // Keep losing the same way? Each repeat raises the odds of a brand-new plan — but
+        // only for legacy deck commanders. An archetype keeps its doctrine (losing a unit
+        // mid-siege shouldn't restart the whole plan from scratch); it just redeploys.
+        if (!this.archetype && Math.random() < Math.min(0.85, 0.25 + this.failStreak * 0.2)) this.redraw();
       }
       this.unit = null;
       this._rising = false; this._recalling = false;
@@ -2982,7 +2998,7 @@ window.RR = {
   get commanders() { return commanders; },
   get flags() { return flags; },
   get teamCtrl() { return TEAM_CTRL; },
-  damageVehicle: (v, amt) => damageVehicle(v || player, amt),
+  damageVehicle: (v, amt, shooter = null) => damageVehicle(v || player, amt, 'vehicle', shooter),
   get damageTally() { return { ...dmgTally }; },
   explodeAt: (x, y, z, blast = 4, dmg = 100) => explodeAt(new THREE.Vector3(x, y, z), blast, dmg, null, null),
   // Headless test hook: run one combat sim step (projectile flight + hits + fx).
