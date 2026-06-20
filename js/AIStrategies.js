@@ -187,16 +187,16 @@ class Turtle extends Strategy {
   objective(cmd) {
     if (this.step === 'grab') return this._flagOrHome(cmd);
     if (this.step === 'siege') return cmd.enemyBasePos();
-    return cmd.homeBasePos();   // defend: hold on our own flag base, in our turrets' cover
+    return cmd.ambushSpot();   // defend: hold to the SIDE in tower cover, ready to flank — not on the flag HQ
   }
   shoot(cmd) { return this.step === 'siege'; }   // hold fire while defending (the brain still engages enemies on sight)
-  arriveDist(cmd) { return this.step === 'grab' ? 3 : this.step === 'defend' ? 6 : 10; }
+  arriveDist(cmd) { return this.step === 'grab' ? 3 : this.step === 'defend' ? 8 : 10; }
   objectiveLabel(cmd) {
     const f = cmd.flag();
     if (f && f.carrier === cmd.unit) return 'home with the flag';
     if (this.step === 'grab') return 'the enemy flag';
     if (this.step === 'siege') return 'the enemy base';
-    return 'home — holding the line';
+    return 'holding the flank (ambush)';
   }
 }
 

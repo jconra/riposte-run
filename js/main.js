@@ -16,8 +16,8 @@ import { Garage, GARAGE_COUNTS } from './Garage.js';
 import { TEAM_COLORS, updateCamo, camoParams } from '../../vehicle-designer/js/CamoTexture.js';
 import { SoundManager } from '../../vehicle-designer/js/SoundManager.js';
 import { Projectiles } from '../../vehicle-designer/js/Projectiles.js';
-import { Brain, randomPersonality } from './AI.js?v=56';
-import { drawStrategy, makeDoctrine, pickArchetype, assignArchetypes, COUNTER } from './AIStrategies.js?v=56';
+import { Brain, randomPersonality } from './AI.js?v=57';
+import { drawStrategy, makeDoctrine, pickArchetype, assignArchetypes, COUNTER } from './AIStrategies.js?v=57';
 import { ExploreMemory } from './ExploreMemory.js?v=54';
 import { astarGrid } from './astar.js';
 import { makeFuelTank, makeAmmoDepot, makeShieldGenerator, makeShieldBubble, RESUPPLY_TINT } from './Resupply.js';
@@ -1684,6 +1684,11 @@ class AICommander {
     this.team = team;
     this.personality = randomPersonality();
     this.archetype = archetype || pickArchetype(Math.random);   // named doctrine (Warrior/Turtle/...) — drives the whole plan
+    // The doctrine shapes disposition: both archetypes FIGHT and finish a routed enemy
+    // (pursue needs aggression > 0.6). A Warrior presses hardest; a Turtle is still
+    // willing to chase a repelled attacker — it just holds a defensive post to do it.
+    const aggMin = this.archetype === 'warrior' ? 0.75 : this.archetype === 'turtle' ? 0.66 : 0;
+    if (this.personality.aggression < aggMin) this.personality.aggression = aggMin;
     this.colorIndex = null;
     this.started = false;
     this.unit = null;
@@ -1733,7 +1738,19 @@ class AICommander {
   }
   enemyBasePos() { return teamCenter(this.targetTeam(), 'main'); }
   enemyFobPos() { return teamCenter(this.targetTeam(), 'fob'); }   // where the enemy's units rise — the Warrior hunts here
-  homeBasePos() { return teamCenter(this.team, 'main'); }           // our own flag base — where the Turtle digs in
+  homeBasePos() { return teamCenter(this.team, 'main'); }           // our own flag base
+  // A holding spot to the SIDE of our flag base — on the enemy-facing edge but offset
+  // off the approach lane, inside tower cover. The Turtle ambushes from here and flanks
+  // an attacker, instead of huddling on the flag HQ (which is what looked too passive).
+  ambushSpot() {
+    const base = this.homeBasePos(), enemy = this.enemyBasePos();
+    let dx = enemy.x - base.x, dz = enemy.z - base.z;
+    const d = Math.hypot(dx, dz) || 1; dx /= d; dz /= d;            // unit vector toward the threat
+    const px = -dz, pz = dx;                                        // perpendicular = "to the side"
+    const side = this.team === 'red' ? 1 : -1;                      // each team commits to one flank
+    const FWD = 18, SIDE = 26;                                      // forward a touch, well to the side, still in tower range
+    return { x: base.x + dx * FWD + px * SIDE * side, z: base.z + dz * FWD + pz * SIDE * side };
+  }
   flag() { return enemyFlagOf(this.team); }
   fortFrac() { return this.fortHp0 ? fortHpOf(this.targetTeam()) / this.fortHp0 : 1; }
   turretsLive() { return turretCountOf(this.targetTeam()); }
