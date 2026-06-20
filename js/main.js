@@ -305,11 +305,16 @@ const SHOT = QS.has('shot');
 const SHOT_SIZE = parseInt(QS.get('size')) || 96;
 const SHOT_FOL = QS.has('fol');
 const SHOT_SEED = QS.has('seed') ? parseInt(QS.get('seed')) : null;
+// Seed policy: normal play gets a FRESH RANDOM map every load (each game is different).
+// `?seed=N` pins it for reproducibility, and `?shot` keeps the fixed default seed so the
+// headless render/test rigs stay deterministic. `?seed` always wins.
+const wantSize = SHOT || QS.has('size');
+const MAP_SEED = SHOT_SEED != null ? SHOT_SEED : SHOT ? null : (Math.random() * 2147483647) | 0;
 // Map generation options, honoured in ANY field mode (so ?aivsai&size&seed is
-// reproducible, not just ?shot). undefined → the map's own random default.
-const GEN_OPTS = (SHOT || QS.has('size') || QS.has('seed')) ? {
-  ...((SHOT || QS.has('size')) ? { cols: SHOT_SIZE, rows: SHOT_SIZE } : {}),
-  ...(SHOT_SEED != null ? { seed: SHOT_SEED } : {}),
+// reproducible, not just ?shot). undefined → the map's own fixed default.
+const GEN_OPTS = (wantSize || MAP_SEED != null) ? {
+  ...(wantSize ? { cols: SHOT_SIZE, rows: SHOT_SIZE } : {}),
+  ...(MAP_SEED != null ? { seed: MAP_SEED } : {}),
 } : undefined;
 // Normal play STARTS IN THE GARAGE (pick team colour + vehicle, then deploy). Only
 // the headless test/spectate paths drop straight onto the field.
