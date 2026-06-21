@@ -113,6 +113,7 @@ export class Garage {
     this._buildBays();
     this.setVehicleScale(2.6);   // settled fleet size (slider seeds from this)
     this._buildSelectionLight();
+    this._buildVictoryFX();
     this._buildCamera();
     this.selectType(this.types[0]);
   }
@@ -446,6 +447,12 @@ export class Garage {
   reset() {
     if (this.deploy) this.deploy.veh.setPose(this.deploy.fromX, 0, this.deploy.fromZ, this.deploy.fromH);
     this.deploy = null;
+    // Tear down any victory staging (winner back in its slot, flag + confetti off).
+    if (this._winSlot) { const s = this._winSlot; s.vehicle.setPose(s.x, 0, s.z, s.heading); this._winSlot = null; }
+    if (this.victoryFlag) this.victoryFlag.visible = false;
+    if (this.victoryLight) this.victoryLight.intensity = 0;
+    if (this.confetti) { this.confetti.visible = false; for (const p of this._conf) p.mesh.visible = false; }
+    this.selRing.visible = true;
     this.phase = 'select';
     this.liftY = 0;
     this.riseProgress = 0;
@@ -499,10 +506,110 @@ export class Garage {
     for (const s of this.slots) s.vehicle.setScale(mult);
   }
 
+  // --- Victory cinematic (3D, in-hangar) --------------------------------
+  // A pool of confetti flakes that rain down over the lift, plus a flag standard
+  // raised beside the winning vehicle. Staged later by playWin(); leftover scaffolding
+  // (a ring of celebrants — beer-toasting crew) can hang off _buildVictoryFX too.
+  _buildVictoryFX() {
+    const N = 260;
+    this.confetti = new THREE.Group();
+    this.confetti.visible = false;
+    this.scene.add(this.confetti);
+    this._conf = [];
+    const geo = new THREE.PlaneGeometry(0.7, 1.05);
+    for (let i = 0; i < N; i++) {
+      const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+        side: THREE.DoubleSide, roughness: 0.5, metalness: 0.0, emissive: '#000000',
+      }));
+      mesh.visible = false;
+      this.confetti.add(mesh);
+      this._conf.push({ mesh, vx: 0, vy: 0, vz: 0, rx: 0, ry: 0, rz: 0 });
+    }
+    // A flag standard presented on the lift next to the winner. The cloth is
+    // emissive so it reads as a bright victory banner under the confetti.
+    const flag = new THREE.Group();
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 15, 8),
+      new THREE.MeshStandardMaterial({ color: '#e7eaec', roughness: 0.35, metalness: 0.6, emissive: '#333', emissiveIntensity: 0.4 }));
+    pole.position.y = 7.5;
+    flag.add(pole);
+    const cloth = new THREE.Mesh(new THREE.PlaneGeometry(7, 4),
+      new THREE.MeshStandardMaterial({ side: THREE.DoubleSide, roughness: 0.55, emissive: '#000', emissiveIntensity: 0.55 }));
+    cloth.position.set(3.5, 12.5, 0);
+    flag.add(cloth);
+    flag.visible = false;
+    this.group.add(flag);
+    this.victoryFlag = flag;
+    this.victoryCloth = cloth;
+
+    // A bright dedicated key light on the lift during the cinematic (off otherwise),
+    // so the dark-hulled winner pops out of the confetti instead of staying murky.
+    this.victoryLight = new THREE.PointLight('#fff2d0', 0, 70, 1.3);
+    this.victoryLight.position.set(0, 15, 7);
+    this.scene.add(this.victoryLight);
+  }
+
+  _respawnConfetti(p, spreadFull = false) {
+    const m = p.mesh;
+    m.visible = true;
+    m.position.set((Math.random() - 0.5) * ELEV_HALF * 3.4,
+      spreadFull ? Math.random() * 30 : 24 + Math.random() * 10,
+      (Math.random() - 0.5) * ELEV_HALF * 3.4);
+    m.rotation.set(Math.random() * 6, Math.random() * 6, Math.random() * 6);
+    p.vx = (Math.random() - 0.5) * 2.4;
+    p.vz = (Math.random() - 0.5) * 2.4;
+    p.vy = -2 - Math.random() * 3;
+    p.rx = (Math.random() - 0.5) * 9; p.ry = (Math.random() - 0.5) * 9; p.rz = (Math.random() - 0.5) * 9;
+    const pal = this._confPalette;
+    m.material.color.set(pal[(Math.random() * pal.length) | 0]);
+  }
+
+  _updateConfetti(dt) {
+    for (const p of this._conf) {
+      const m = p.mesh;
+      m.position.x += p.vx * dt; m.position.y += p.vy * dt; m.position.z += p.vz * dt;
+      p.vy = Math.max(-13, p.vy - 9 * dt);     // gravity, terminal velocity
+      m.rotation.x += p.rx * dt; m.rotation.y += p.ry * dt; m.rotation.z += p.rz * dt;
+      if (m.position.y < 0.3) this._respawnConfetti(p);   // recycle near the floor → endless rain
+    }
+  }
+
+  // Stage the win: present the winning type's deploy vehicle up on the raised lift,
+  // facing the camera, with a flag + raining confetti in the team colour.
+  playWin(type, teamHex = '#ffd24a') {
+    if (DEPLOY_SLOT[type] === undefined) type = 'firebrat';
+    this.selType = type;
+    const s = this.slots[DEPLOY_SLOT[type]];
+    this._winSlot = s;
+    s.vehicle.group.visible = true;
+    const presentH = 5;
+    this.liftY = presentH;
+    this.elevatorPad.position.y = -0.15 + presentH;
+    if (this.ram) { this.ram.visible = true; this._updateRam(); }
+    const faceH = Math.atan2(this.camera.position.x, this.camera.position.z) + Math.PI;   // front (-Z) toward the cam
+    s.vehicle.setPose(0, presentH, 0, faceH);
+    this._placeSelLight({ x: 0, z: 0 });
+    this.selRing.visible = false;
+    this.victoryFlag.visible = true;
+    this.victoryFlag.position.set(-7, presentH, 5);
+    this.victoryCloth.material.color.set(teamHex);
+    this.victoryCloth.material.emissive.set(teamHex);
+    this.victoryLight.intensity = 70;
+    this._confPalette = [teamHex, teamHex, teamHex, '#ffffff', '#ffd24a'];
+    this.confetti.visible = true;
+    for (const p of this._conf) this._respawnConfetti(p, true);   // pre-fill the column so it rains from frame 1
+    this.phase = 'victory';
+  }
+
   update(dt) {
     // Nothing animates while just browsing — the whole garage holds its powered-
     // down rest pose. Engines/gait only spin up once a deploy is CONFIRMED.
-    if (this.phase !== 'select') this._updateDeploy(dt);
+    if (this.phase === 'victory') {
+      this._updateConfetti(dt);
+      if (this._winSlot) this._winSlot.vehicle.model.update(dt, 0, 0);   // gentle idle on the winner
+      if (this.victoryCloth) this.victoryCloth.rotation.y = Math.sin(this.lampTime * 2.5) * 0.22;   // flag flutter
+    } else if (this.phase !== 'select') {
+      this._updateDeploy(dt);
+    }
     this.lampTime += dt;
     // gentle pulse on the selection ring
     const k = 0.7 + Math.sin(this.lampTime * 3) * 0.15;

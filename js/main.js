@@ -12,11 +12,11 @@ import { RoadNetwork } from './Roads.js?v=78';
 import { Foliage } from './Foliage.js?v=1';
 import { Vehicle, VEHICLE_TYPES } from './Vehicles.js?v=65';
 import { Elevator } from './Elevator.js';
-import { Garage, GARAGE_COUNTS } from './Garage.js';
+import { Garage, GARAGE_COUNTS } from './Garage.js?v=1';
 import { TEAM_COLORS, updateCamo, camoParams } from '../../vehicle-designer/js/CamoTexture.js';
 import { SoundManager } from '../../vehicle-designer/js/SoundManager.js';
 import { Projectiles } from '../../vehicle-designer/js/Projectiles.js';
-import { Brain, randomPersonality } from './AI.js?v=63';
+import { Brain, randomPersonality } from './AI.js?v=64';
 import { drawStrategy, makeDoctrine, pickArchetype, assignArchetypes, COUNTER } from './AIStrategies.js?v=57';
 import { ExploreMemory } from './ExploreMemory.js?v=54';
 import { astarGrid } from './astar.js';
@@ -533,6 +533,7 @@ let waterT = 0;         // elapsed seconds driving the animated water ripples (p
 let victoryReturn = false; // the current lift descent is a winning flag extraction (run the cinematic)
 let victoryHoldT = 0;      // beat held at the bottom of a victory descent before fading out
 const VICT_HOLD = 1.9;     // seconds to linger on the celebration at the bottom
+const WIN_CINEMATIC_MS = 5200;   // how long the in-hangar victory cinematic plays before the menu pops
 
 // Team accent colours (match Camp's wall accents) + camo palette slot per team
 // (indices into TEAM_COLORS: 4 = RED, 5 = BLUE).
@@ -2230,6 +2231,7 @@ class AICommander {
     if (!v) return;
     const view = this._view(v, dt);
     const cmd = v.ai.think(view);
+    v._aiState = cmd.state;                 // exposed so a rival's _view can tell this unit is retreating ("finish him")
     this._navOverride(v, view, cmd, dt);   // route travel states with A* (around water/trees, through gates)
     this._logTick(v, view, cmd);
     const out = burnFuel(v, { fwd: cmd.fwd, turn: cmd.turn }, dt);
@@ -2265,7 +2267,8 @@ class AICommander {
       if (o.dead || o.team === this.team) continue;
       const d = (o.holder.position.x - px) ** 2 + (o.holder.position.z - pz) ** 2;
       if (d < best && (flyer || hasLOS(px, pz, o.holder.position.x, o.holder.position.z))) {
-        best = d; enemy = { x: o.holder.position.x, y: o.holder.position.y, z: o.holder.position.z, type: o.type, shield: o.shield, vx: o._vx || 0, vz: o._vz || 0 }; seen = o; seesEnemy = true;
+        best = d; enemy = { x: o.holder.position.x, y: o.holder.position.y, z: o.holder.position.z, type: o.type, shield: o.shield, vx: o._vx || 0, vz: o._vz || 0,
+          hpFrac: o.maxHp ? o.hp / o.maxHp : 1, retreating: o._aiState === 'retreat' || o._aiState === 'resupply' }; seen = o; seesEnemy = true;
       }
     }
     // Fog-of-war intel: remember what the enemy keeps fielding so counterVehicle() works.
@@ -3124,7 +3127,13 @@ function showGameMenu(opts = {}) {
 function hideGameMenu() { const m = document.getElementById('gamemenu'); if (m) m.classList.remove('show'); }
 
 if (GARAGE) ensureGarage();
-if (START_MENU) showGameMenu();   // open the start screen over the hangar
+if (QS.has('win')) {
+  // Preview the in-hangar victory cinematic without playing a match: ?win or ?win=jotun.
+  setGarageOverlays(false);
+  const c = teamColor(PLAYER_TEAM);
+  garage.playWin(QS.get('win') || 'firebrat', c);
+  showCelebTitle('VICTORY!', c, 'FLAG SECURED');
+} else if (START_MENU) showGameMenu();   // open the start screen over the hangar
 
 // Garage → island handoff. Fired once the garage rise has fully faded to black
 // (garage.phase === 'done'). Builds the island ONCE (behind the black overlay), then
@@ -3159,7 +3168,9 @@ function beginReturn() {
   // Riding a stolen enemy flag down the lift IS the win — kick off the cinematic.
   victoryReturn = !!flags.find(f => f.carried && f.carrier === player);
   victoryHoldT = 0;
-  if (victoryReturn) playVictory(PLAYER_TEAM);
+  // Title only on the field descent — the confetti celebration now plays in 3D
+  // inside the hangar once the lift lands (see returnToGarage → garage.playWin).
+  if (victoryReturn) showCelebTitle('VICTORY!', teamColor(PLAYER_TEAM), 'FLAG SECURED');
   clearLock();
   try { if (sound && sound.enabled) sound.toggle(); } catch (e) { /* audio is best-effort */ }   // engine winds down as it parks + lowers
   const h = Math.atan2(playerElev.center.x, playerElev.center.z);
@@ -3190,10 +3201,21 @@ function returnToGarage() {
     captured.group.position.set(captured.home.x, captured.home.y, captured.home.z);   // flag back on its post
     flagsCaptured++;   // the VICTORY cinematic already played over the descent (playVictory)
   }
-  clearCeleb();        // tidy any confetti/title before the hangar shows
-  // Match decided (not a mid-match death/redeploy) → open the play-again menu. A pick
-  // reloads into a brand new world; the deploy hangar stays hidden behind it.
-  if (matchOver) showGameMenu({ header: matchWon ? 'VICTORY' : 'DEFEAT', sub: 'MATCH OVER', reload: true });
+  clearCeleb();        // tidy any field confetti/title before the hangar shows
+  // Match decided (not a mid-match death/redeploy) → celebrate, then open the
+  // play-again menu (a pick reloads into a brand new world).
+  if (matchOver) {
+    if (matchWon) {
+      // In-hangar victory cinematic: the winner presented on the lift with the flag
+      // and 3D confetti, VICTORY title, then the menu pops over it after a beat.
+      const c = teamColor(PLAYER_TEAM);
+      garage.playWin('firebrat', c);   // the Firebrat is the only flag-carrier, so it's always the winner on the lift
+      showCelebTitle('VICTORY!', c, 'FLAG SECURED');
+      setTimeout(() => { hideCelebTitle(); showGameMenu({ header: 'VICTORY', sub: 'MATCH OVER', reload: true }); }, WIN_CINEMATIC_MS);
+    } else {
+      showGameMenu({ header: 'DEFEAT', sub: 'MATCH OVER', reload: true });
+    }
+  }
 }
 
 // Security-camera overlay for the garage: vignette + scanlines + REC + clock.
@@ -3372,6 +3394,7 @@ window.RR = {
   get player() { return player; },
   spawnPlayer: (type = 'firebrat', colorIndex = 4, rise = false) => deployToFOB(type, colorIndex, rise),
   get garage() { return garage; },
+  winDemo: (type = 'firebrat', hex = '#46d6ff') => { ensureGarage(); garage.playWin(type, hex); },   // headless: stage the victory cinematic
   get onField() { return onField; },
   get returning() { return returning; },
   forceReturn: () => { if (player && playerElev) { leftPad = true; beginReturn(); } },

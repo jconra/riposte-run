@@ -87,6 +87,11 @@ const CONDITIONS = {
   always:       () => true,
   mustGo:       (v) => !!v.mustGo,                         // still inside the gate
   hurtLatched:  (v, m) => m._hurt,                         // pulled out to patch up
+  // "Finish him": we're hurt enough to bail, BUT the rival we see is even worse off
+  // (lower hp) or is itself running — and we still have ammo. Don't both limp away;
+  // turn and put it down. Overrides the hurt retreat only (evaluated just above it).
+  finishHim: (v, m, p) => m._hurt && v.seesEnemy && v.enemy && ammoFrac(v) > 0 &&
+    (v.enemy.retreating || (v.enemy.hpFrac != null && v.enemy.hpFrac <= v.self.hpFrac)),
   resupLatched: (v, m) => m._resup,                        // heading home to rearm/refuel
   shootGoal:    (v) => !!v.shootGoal,                      // the goal is a fortification
 
@@ -352,6 +357,7 @@ export const DEFAULT_BRAIN = {
   // then the objective. `target` says what the chosen behavior aims at.
   transitions: [
     { when: 'mustGo',       mode: 'exit',     target: 'goal' },
+    { when: 'finishHim',    mode: 'engage',   target: 'enemy' },
     { when: 'hurtLatched',  mode: 'retreat',  target: 'home' },
     { when: 'resupLatched', mode: 'resupply', target: 'resupplyOrGoal' },
     { when: 'engaging',     mode: 'engage',   target: 'enemy' },
