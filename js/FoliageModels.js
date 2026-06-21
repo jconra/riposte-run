@@ -7,8 +7,8 @@ import * as THREE from 'three';
 
 const BARK   = new THREE.MeshStandardMaterial({ color: '#8a6a42', roughness: 1.0, flatShading: true });
 const DRYBARK= new THREE.MeshStandardMaterial({ color: '#9c8460', roughness: 1.0, flatShading: true });
-const LEAF   = new THREE.MeshStandardMaterial({ color: '#5f8f33', roughness: 0.95, flatShading: true });
-const LEAF2  = new THREE.MeshStandardMaterial({ color: '#6fa03d', roughness: 0.95, flatShading: true });
+const LEAF   = new THREE.MeshStandardMaterial({ color: '#416125', roughness: 0.95, flatShading: true });
+const LEAF2  = new THREE.MeshStandardMaterial({ color: '#4c6d29', roughness: 0.95, flatShading: true });
 const ROCK   = new THREE.MeshStandardMaterial({ color: '#9a948a', roughness: 1.0, flatShading: true });
 
 const rand = (a, b) => a + Math.random() * (b - a);

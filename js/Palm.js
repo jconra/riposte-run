@@ -7,7 +7,7 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 const TRUNK_MAT = new THREE.MeshStandardMaterial({ color: '#9a7b4f', roughness: 1.0, flatShading: true });
-const FROND_MAT = new THREE.MeshStandardMaterial({ color: '#5f8f33', roughness: 0.95, flatShading: true, side: THREE.DoubleSide });
+const FROND_MAT = new THREE.MeshStandardMaterial({ color: '#416125', roughness: 0.95, flatShading: true, side: THREE.DoubleSide });
 const COCO_MAT  = new THREE.MeshStandardMaterial({ color: '#5a4326', roughness: 1.0, flatShading: true });
 
 // A single drooping frond blade along +X, tapering to a point, sagging in -Y.

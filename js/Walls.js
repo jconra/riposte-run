@@ -59,7 +59,7 @@ export class Wall {
 
     if (this.turret) {
       this.turretDest = new Destructible(this.turret.head, {
-        type: 'gun', hp: 120,
+        type: 'gun', hp: 180,
         onDestroyed: () => this._killTurret(),
       });
       manager.add(this.turretDest);

@@ -7,16 +7,16 @@ import { IslandMap, DEFAULTS } from './IslandMap.js?v=63';
 import { Controls } from './Controls.js';
 import { DestructibleManager, Destructible } from './Destructible.js';
 import { BuildGrid } from './BuildGrid.js';
-import { Camp } from './Walls.js?v=50';
+import { Camp } from './Walls.js?v=51';
 import { RoadNetwork } from './Roads.js?v=78';
-import { Foliage } from './Foliage.js?v=1';
+import { Foliage } from './Foliage.js?v=2';
 import { Vehicle, VEHICLE_TYPES } from './Vehicles.js?v=65';
 import { Elevator } from './Elevator.js';
 import { Garage, GARAGE_COUNTS } from './Garage.js?v=1';
 import { TEAM_COLORS, updateCamo, camoParams } from '../../vehicle-designer/js/CamoTexture.js';
 import { SoundManager } from '../../vehicle-designer/js/SoundManager.js';
 import { Projectiles } from '../../vehicle-designer/js/Projectiles.js';
-import { Brain, randomPersonality } from './AI.js?v=67';
+import { Brain, randomPersonality } from './AI.js?v=68';
 import { drawStrategy, makeDoctrine, pickArchetype, assignArchetypes, COUNTER } from './AIStrategies.js?v=59';
 import { ExploreMemory } from './ExploreMemory.js?v=54';
 import { astarGrid } from './astar.js';
@@ -759,9 +759,9 @@ const VEH_MOVE = {
 // ammo = shots carried (fast guns carry more, heavy hitters few); shield = the
 // MAX armour pool a shield-generator pickup can give this vehicle (starts at 0).
 const VEH_STATS = {
-  lurcher:  { hp: 220, fuel: 200, burn: 2.4, ammo: 45, shield: 110 },
+  lurcher:  { hp: 220, fuel: 200, burn: 2.4, ammo: 68, shield: 110 },
   firebrat: { hp: 90,  fuel: 200, burn: 3.0, ammo: 90, shield: 45  },
-  valkyrie: { hp: 140, fuel: 200, burn: 4.2, ammo: 24, shield: 75  },
+  valkyrie: { hp: 140, fuel: 260, burn: 4.2, ammo: 24, shield: 75  },
   jotun:    { hp: 320, fuel: 200, burn: 2.0, ammo: 12, shield: 160 },
 };
 const SINK_RATE = 1.2;     // units/sec a land vehicle floods when over water
@@ -1597,7 +1597,7 @@ function updateFlags(dt) {
     if (!f.revealed) {
       if (f.hqBody && f.hqBody.dead) {
         f.revealed = true; f.group.visible = true; f.dropT = DROP_DUR;
-        showBanner(`${f.team.toUpperCase()} HQ DOWN — FLAG EXPOSED`, { color: '#ffd0a0' });
+        showBanner(`${flagColorName(f)} HQ DOWN — FLAG EXPOSED`, { color: '#ffd0a0' });
       } else if (!f.carried) { continue; }   // still entombed and not in play — skip
     }
     if (f.dropT > 0 && !f.carried) {          // gravity-ish drop into the rubble
@@ -2465,15 +2465,17 @@ class AICommander {
     const fob = teamCamp(this.team, 'fob'), home = teamCamp(this.team, 'main');
     const lowAmmo = v.ammo < v.maxAmmo * 0.6;       // matches config.ammoFull (latch clear)
     const lowFuel = v.fuel < v.maxFuel * 0.5;       // matches config.fuelFull (latch clear)
-    let supply = null, bestD = Infinity;
-    const consider = (x, z) => { const d = (px - x) ** 2 + (pz - z) ** 2; if (d < bestD) { bestD = d; supply = { center: { x, z } }; } };
-    if (fob) consider(fob.center.x, fob.center.z);
-    if (home) consider(home.center.x, home.center.z);
+    let supply = null, bestD = Infinity, supplyHeals = false;
+    // isBase = an OWN base (restocks fuel + ammo AND patches the hull); a depot does not.
+    const consider = (x, z, isBase) => { const d = (px - x) ** 2 + (pz - z) ** 2; if (d < bestD) { bestD = d; supply = { center: { x, z } }; supplyHeals = isBase; } };
+    if (fob) consider(fob.center.x, fob.center.z, true);
+    if (home) consider(home.center.x, home.center.z, true);
     // A neutral depot is only worth the detour if topping its one resource fully clears
     // the latch — i.e. it's the single low resource. Both low → base only (above).
     const depotKind = (lowAmmo && !lowFuel) ? 'ammo' : (lowFuel && !lowAmmo) ? 'fuel' : null;
-    if (depotKind) for (const rp of resupplies) if (!rp.dead && rp.kind === depotKind && this.knownSupplies.has(rp)) consider(rp.pos.x, rp.pos.z);
+    if (depotKind) for (const rp of resupplies) if (!rp.dead && rp.kind === depotKind && this.knownSupplies.has(rp)) consider(rp.pos.x, rp.pos.z, false);
     this._supply = supply ? { x: supply.center.x, z: supply.center.z } : null;   // nav target while resupplying
+    this._supplyHeals = supplyHeals;   // chosen supply is an own base → hold for a FULL top-off (ammo+fuel+hp)
     // HEAL home: HP only regenerates at an OWN base (a neutral fuel/ammo depot can't
     // patch the hull) — so a hurt unit must fall back HERE, not to the nearest depot,
     // or it camps a fuel tank forever waiting for health that never comes.
@@ -2582,6 +2584,7 @@ class AICommander {
       goal: mustGo ? this._exit : goal,
       mustGo,
       resupply: supply ? { x: supply.center.x, z: supply.center.z } : goal,
+      supplyHeals,   // the chosen resupply point is an own base → hold until ammo+fuel+hp are all maxed
       home: healHome || goal,
       shootGoal: this.strategy.shoot(this), arriveDist: this._intercepting ? 4 : this._shielding ? 6 : this.strategy.arriveDist(this),
       blockedAhead,
@@ -2680,6 +2683,21 @@ function logTint(hex) {
 }
 // A team's log colour: its real on-field tint, brightened for the panel.
 function teamLogColor(team) { return logTint(teamColor(team)); }
+// A team's PALETTE COLOUR NAME (GREY, PURPLE, CYAN…) for banners/menus — so a win
+// message names the colour the team actually wears, never the internal red/blue id.
+function teamColorName(team) { return colorName(teamColor(team)); }
+// Remaining fleet as a glyph string, one letter per ALIVE vehicle (the fielded one
+// counts until it dies), grouped by type: e.g. FFFFFF-LLL-VV-JJ → 6 Firebrats, 3
+// Lurchers, 2 Valkyries, 2 Jotuns. Empty groups drop out; a wiped fleet shows "—".
+function fleetStr(cmd) {
+  const GLYPH = { firebrat: 'F', lurcher: 'L', valkyrie: 'V', jotun: 'J' };
+  const parts = [];
+  for (const t of ['firebrat', 'lurcher', 'valkyrie', 'jotun']) {
+    const n = cmd.roster ? (cmd.roster[t] || 0) : 0;
+    if (n > 0) parts.push(GLYPH[t].repeat(n));
+  }
+  return parts.length ? parts.join('-') : '—';
+}
 function ensureCelebStyle() {
   if (document.getElementById('celeb-style')) return;
   const s = document.createElement('style'); s.id = 'celeb-style';
@@ -2803,11 +2821,12 @@ function updateAiLog() {
   for (const cmd of commanders) {
     const d = cmd._dbg;
     const col = teamLogColor(cmd.team);
-    if (!d) { html += `<span style="color:${col}">${cmd.cname} — deploying…</span>\n`; continue; }
+    if (!d) { html += `<span style="color:${col}">${cmd.cname} — deploying…\n  fleet ${fleetStr(cmd)}</span>\n`; continue; }
     html += `<span style="color:${col}">${d.name} ${d.type} ${d.card}  enemyTwrs:${d.towers}\n`;
     html += `  ${d.state}  blk:${d.blk}  f/t:${d.fwd}/${d.turn}\n`;
     if (d.stuck) html += `  ⚠ STUCK ${d.stuck}s — ${d.stuckWhy}\n`;
-    html += `  hp:${d.hp}% ammo:${d.ammo} fuel:${d.fuel}  fob:${d.distFob}u</span>\n`;
+    html += `  hp:${d.hp}% ammo:${d.ammo} fuel:${d.fuel}  fob:${d.distFob}u\n`;
+    html += `  fleet ${fleetStr(cmd)}</span>\n`;
   }
   html += '<span style="opacity:0.55">────────────</span>\n';
   const line = e => `<span style="opacity:0.8">${e.t.toFixed(0)}s</span> <span style="color:${teamLogColor(e.team)}">${e.msg}</span>\n`;
@@ -2833,7 +2852,7 @@ function endMatch(winner) {
   const human = TEAM_CTRL[PLAYER_TEAM] === 'human';
   const won = winner === PLAYER_TEAM;
   matchWon = won;
-  if (!human) { playVictory(winner); showCelebTitle(`${winner.toUpperCase()} WINS`, teamColor(winner)); }
+  if (!human) { playVictory(winner); showCelebTitle(`${teamColorName(winner)} WINS`, teamColor(winner)); }
   else if (won) playVictory(PLAYER_TEAM);   // a non-extraction win (e.g. AI ally caps) still celebrates
   else playDefeat();
   try { if (sound && sound.enabled) sound.toggle(); } catch (e) { /* quiet the engine */ }
@@ -2842,7 +2861,7 @@ function endMatch(winner) {
     if (human) { if (player && playerElev) { leftPad = true; beginReturn(); } else returnToGarage(); }
     // AI-vs-AI: the match is decided — open the play-again menu over the frozen field
     // (reload starts a fresh game; nothing rebuilds in place).
-    else showGameMenu({ header: `${winner.toUpperCase()} WINS`, sub: 'MATCH OVER', reload: true });
+    else showGameMenu({ header: `${teamColorName(winner)} WINS`, sub: 'MATCH OVER', reload: true });
   }, 5000);
 }
 
@@ -3602,6 +3621,7 @@ window.RR = {
   forceReturn: () => { if (player && playerElev) { leftPad = true; beginReturn(); } },
   // Preview the end-of-match cinematic without playing a whole round.
   celebrate: (kind = 'victory', team = PLAYER_TEAM) => kind === 'defeat' ? playDefeat() : playVictory(team),
+  teamColorName: (t) => teamColorName(t),                     // debug: a team's palette colour name (win banner)
   navPlan: (v, x, z) => planPath(v, { x, z }),                 // debug: A* path for a unit
   navCellBlocked: (v, i, j) => cellBlocked(v, i, j),          // debug: nav passability of a cell
   avoidCell: (x, z) => avoidCell(x, z),                       // debug: blacklist a cell (stuck-escalation)

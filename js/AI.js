@@ -115,7 +115,12 @@ const CONDITIONS = {
 
   // --- latch triggers ---
   resupNeeded: (v, m, p, cfg) => ammoFrac(v) <= 0 || v.self.fuelFrac < cfg.fuelLow,
-  resupDone:   (v, m, p, cfg) => ammoFrac(v) > cfg.ammoFull && v.self.fuelFrac > cfg.fuelFull,
+  // At an OWN BASE (which also patches the hull) hold until ammo, fuel AND hp are ALL
+  // topped off — don't roll back out half-healed. At a single-resource depot, clear on
+  // the usual restock lines (it can't fill the others, so waiting would camp it forever).
+  resupDone:   (v, m, p, cfg) => v.supplyHeals
+    ? (ammoFrac(v) >= cfg.topFull && v.self.fuelFrac >= cfg.topFull && v.self.hpFrac >= cfg.topFull)
+    : (ammoFrac(v) > cfg.ammoFull && v.self.fuelFrac > cfg.fuelFull),
   hurtNeeded:  (v, m, p, cfg) => v.self.hpFrac < bailOf(p, cfg),
   hurtDone:    (v, m, p, cfg) => v.self.hpFrac > cfg.hurtClear,
 };
@@ -390,8 +395,9 @@ export const DEFAULT_BRAIN = {
     bailAggr: 0.18,
     hurtClear: 0.8,      // hp fraction that clears the "hurt" retreat latch
     fuelLow: 0.18,       // fuel fraction that trips the resupply latch
-    fuelFull: 0.5,       // fuel fraction that clears it
-    ammoFull: 0.6,       // ammo fraction that clears it
+    fuelFull: 0.5,       // fuel fraction that clears it (at a single-resource depot)
+    ammoFull: 0.6,       // ammo fraction that clears it (at a single-resource depot)
+    topFull: 0.99,       // at an OWN BASE (heals too) don't leave until ammo, fuel AND hp are ALL maxed
   },
   // Latched interrupts: once tripped they hold (hysteresis) until their clear
   // condition, and force the matching state via the transition table below.
