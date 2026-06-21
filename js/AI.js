@@ -377,6 +377,8 @@ export const DEFAULT_BRAIN = {
   config: {
     stillEps: 0.05,      // movement under this (units/tick) counts as "not moving"
     stillLimit: 1.8,     // seconds wedged before the unstick jolt fires
+    wedgeLimit: 1.6,     // seconds PRESSED on an obstacle with no gain on the goal before the jolt (a unit sliding along a wall/turret is "moving" but going nowhere)
+    wedgeGain: 0.4,      // goal distance must shrink by at least this to count as progress
     unstickDur: 0.7,     // jolt duration (seconds)
     unstickRev: 0.7,     // reverse throttle during the jolt
     dodgeClear: 0.6,     // seconds the path must stay clear before forgetting which way we were going round
@@ -445,7 +447,23 @@ export function runBrain(graph, view, mem) {
     return { fwd: -cfg.unstickRev, turn: mem._unstickTurn, fire: false, state: 'unstick' };
   }
   if (mem._wantMove && moved < cfg.stillEps) mem._stillT += view.dt; else mem._stillT = 0;
-  if (mem._stillT > cfg.stillLimit) { mem._unstick = cfg.unstickDur; mem._unstickTurn = mem.rng() < 0.5 ? -1 : 1; mem._stillT = 0; }
+  // Progress wedge: a unit can SLIDE along a wall/turret at full speed (so the motion
+  // check above never trips) yet make no headway toward its goal — it just grinds the
+  // obstacle. If it's pressed against something AND its distance to the goal stops
+  // shrinking, count that as a wedge too and fire the same reverse-pivot to spin free.
+  const pressed = view.blockedAhead || view.blockedLeft || view.blockedRight;
+  // …unless it's deliberately squared up shooting a wall/tree clear (a breach) — that's
+  // intentional pressing, so let the breach/patience system own it instead of jolting.
+  const breaching = view.breakTarget && view.blockedAhead && mem.state !== 'engage' && mem.state !== 'suppress';
+  const gd = view.goal ? Math.hypot(view.goal.x - self.x, view.goal.z - self.z) : 0;
+  if (mem._wantMove && pressed && !breaching) {
+    if (mem._bestGoalD == null || gd < mem._bestGoalD - cfg.wedgeGain) { mem._bestGoalD = gd; mem._wedgeT = 0; }
+    else mem._wedgeT += view.dt;
+  } else { mem._bestGoalD = gd; mem._wedgeT = 0; }
+  if (mem._stillT > cfg.stillLimit || mem._wedgeT > cfg.wedgeLimit) {
+    mem._unstick = cfg.unstickDur; mem._unstickTurn = mem.rng() < 0.5 ? -1 : 1;
+    mem._stillT = 0; mem._wedgeT = 0; mem._bestGoalD = null;
+  }
 
   // Remember the last confirmed sighting (fuels the 'pursuing' condition).
   if (view.seesEnemy && view.enemy) mem.lastSeen = { x: view.enemy.x, z: view.enemy.z, t: mem.t };
@@ -497,6 +515,8 @@ export class Brain {
     this._hurt = false;       // latched: badly damaged → fall back to base to patch up
     this._lx = null; this._lz = null;   // last position (anti-wedge movement check)
     this._stillT = 0;         // time spent trying to move but not moving
+    this._wedgeT = 0;         // time PRESSED on an obstacle with no gain on the goal (sliding-along-a-wall wedge)
+    this._bestGoalD = null;   // closest the unit has gotten to the goal during the current press
     this._unstick = 0;        // remaining time of a reverse-and-pivot jolt
     this._unstickTurn = 1;
     this._wantMove = false;   // did last tick intend to drive forward?

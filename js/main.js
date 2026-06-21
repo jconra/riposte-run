@@ -16,7 +16,7 @@ import { Garage, GARAGE_COUNTS } from './Garage.js?v=1';
 import { TEAM_COLORS, updateCamo, camoParams } from '../../vehicle-designer/js/CamoTexture.js';
 import { SoundManager } from '../../vehicle-designer/js/SoundManager.js';
 import { Projectiles } from '../../vehicle-designer/js/Projectiles.js';
-import { Brain, randomPersonality } from './AI.js?v=66';
+import { Brain, randomPersonality } from './AI.js?v=67';
 import { drawStrategy, makeDoctrine, pickArchetype, assignArchetypes, COUNTER } from './AIStrategies.js?v=59';
 import { ExploreMemory } from './ExploreMemory.js?v=54';
 import { astarGrid } from './astar.js';
@@ -542,9 +542,6 @@ const TEAM_CAMO   = { red: 4, blue: 5 };
 // Default vehicle each team fields (used for the plain-field player until a real
 // garage deploy chooses one).
 const FOB_RIDER = { red: 'jotun', blue: 'firebrat' };
-// Role classes for roster substitution: when the wanted vehicle is used up, the
-// commander falls back to one in the same weight class before resorting to anything.
-const HEAVY_TYPES = ['jotun', 'lurcher'], FAST_TYPES = ['firebrat', 'valkyrie'];
 const PLAYER_TEAM = 'red';   // the garage / player's side
 // Who runs each team: 'human' (player drive/garage) or 'ai' (an AICommander).
 // Flexible by design — flip any team to 'ai' for AI-vs-AI, or extend for more
@@ -1344,7 +1341,7 @@ function creditKill(killer, victim) {
   const cmd = commanders.find(c => c.team === killer.team);
   if (!cmd) return;
   cmd.kills = (cmd.kills || 0) + 1;
-  aiLog(killer.team, `${cmd.personality.name} ${killer.type} downs a ${victim.type} (${cmd.kills} kills)`);
+  aiLog(killer.team, `${cmd.cname} ${killer.type} downs a ${victim.type} (${cmd.kills} kills)`);
 }
 function destroyVehicle(veh, cause, killer = null) {
   if (veh.dead) return;
@@ -1355,7 +1352,7 @@ function destroyVehicle(veh, cause, killer = null) {
   // Surface what happened to the AI unit — drowned/destroyed units used to just vanish.
   if (veh.ai && veh.team) {
     const how = cause === 'sank' ? 'DROWNED' : 'destroyed';
-    aiLog(veh.team, `${veh.ai.p ? veh.ai.p.name : '?'} ${veh.type} ${how}`);
+    aiLog(veh.team, `${teamLabel(veh.colorIndex)} ${veh.type} ${how}`);
   }
   removeCombatant(veh);
   if (veh.ai) veh.ai.dead = true;
@@ -1393,6 +1390,7 @@ function blockedFor(move, avoidWater) {
     if (avoidWater && move.water === 'sink' && map.isDeepWater(x, z)) return true;   // shallow is fordable
     if (move.ignoreWalls) return false;              // Valkyrie clears walls
     for (const o of obstacles) {
+      if (o.body && o.body.dead) continue;           // a blown-up wall/tower no longer blocks — drive over the rubble
       const dx = x - o.x, dz = z - o.z, rr = o.r + VEH_R;
       if (dx * dx + dz * dz < rr * rr) return true;
     }
@@ -1806,10 +1804,12 @@ function updateResupplies(dt) {
 // reusing each vehicle's OWN `_blocked` oracle as the passability test — so walls,
 // the coast (for sinkers) and bump-trees (for the Firebrat) are all impassable, while
 // crushers plough through trees and roads are preferred. Flyers skip this entirely.
-// A* passability for a grid cell — a NAV-specific oracle, gentler than the player's
-// collision `_blocked`: walls keep a smaller margin (so gates/tight spots stay
-// threadable; drive()'s full-radius slide handles the fine bit), gate corridors,
-// roads and elevator pads are explicitly open, and sinkers still avoid open water.
+// A* passability for a grid cell. It mirrors the player's collision `_blocked` so a
+// planned path is one the full-radius hull can actually drive: walls keep nearly the
+// collision margin (a path that hugs a fat CORNER tower the nav once thought passable
+// but collision didn't sent units grinding into the corner). Gate corridors, roads
+// and elevator pads are explicitly open (so the tighter margin can't seal a gate), and
+// sinkers still avoid open water. drive()'s full-radius slide handles the final sliver.
 function cellBlocked(v, i, j) {
   const c = grid.cell, x = i * c, z = j * c;
   const halfW = map.worldW / 2 + 24, halfH = map.worldH / 2 + 24;
@@ -1818,11 +1818,17 @@ function cellBlocked(v, i, j) {
   if (gateCells.has(i + ',' + j)) return false;
   if (roadNet.cells && roadNet.cells.has(i + ',' + j)) return false;
   if (elevatorPadAt(x, z)) return false;
+  if (gateSideCells.has(i + ',' + j)) return true;   // a gate flank — force the centre throat
+  if (navAvoid.size) {                               // temporary no-go (a spot a unit kept grinding) — NEVER over a gate/road/pad (handled above) so it can't strand
+    const e = navAvoid.get(i + ',' + j);
+    if (e !== undefined) { if (e > performance.now()) return true; navAvoid.delete(i + ',' + j); }
+  }
   const m = v._move;
   if (m.water === 'sink' && map.isDeepWater(x, z)) return true;   // sinkers route around DEEP water; shallow is fordable
   if (!m.ignoreWalls) {
-    const margin = VEH_R * 0.45;
+    const margin = VEH_R * 0.9;   // ≈ collision's full VEH_R, so A* won't route into a corner the hull can't enter
     for (const o of obstacles) {
+      if (o.body && o.body.dead) continue;           // destroyed wall/tower → A* may route through the gap
       const dx = x - o.x, dz = z - o.z, rr = o.r + margin;
       if (dx * dx + dz * dz < rr * rr) return true;
     }
@@ -1852,11 +1858,21 @@ function planPath(v, dest) {
   const roads = roadNet.cells;
   const cost = (i, j) => {
     if (cellBlocked(v, i, j)) return Infinity;
-    return roads && roads.has(i + ',' + j) ? 0.5 : 1;   // roads are the cheap lane
+    const k = i + ',' + j;
+    return (roads && roads.has(k)) || gateCells.has(k) ? 0.5 : 1;   // roads + gate centre are the cheap lane
   };
   const path = astarGrid({ start, goal, cost, inBounds, turnPenalty: 3 });
   if (!path || path.length < 2) return null;
   return path.map(n => ({ x: n.i * c, z: n.j * c }));
+}
+// Stuck-escalation: after this many seconds genuinely stuck, a unit marks the spot it's
+// grinding impassable (avoidCell) and replans AROUND it, instead of repeating forever.
+const NAV_BLOCK_AFTER = 6.0;        // seconds stuck before we blacklist the trouble spot + replan
+const NAV_AVOID_MS = 5000;          // how long a blacklisted cell stays no-go (then it reopens)
+const navAvoid = new Map();         // cellKey "i,j" -> expiry timestamp (ms); temporary A* no-go zones
+function avoidCell(x, z) {
+  const c = grid.cell, i = Math.round(x / c), j = Math.round(z / c);
+  navAvoid.set(i + ',' + j, performance.now() + NAV_AVOID_MS);
 }
 // Maintain a unit's cached path toward `dest` and return the next waypoint to steer
 // at (skips waypoints already reached). Replans on a timer, when the goal moves, or
@@ -1869,18 +1885,37 @@ function navWaypoint(nav, v, dest, dt) {
     nav.path = planPath(v, dest); nav.idx = 0; nav.t = 1.1; nav.dx = dest.x; nav.dz = dest.z;
     if (!nav.path) return null;
   }
+  // Follow the path LOCALLY: consume the current waypoint only once the unit reaches it
+  // (capture radius) or has clearly driven PAST it (it's nearer the NEXT node). Both
+  // tests compare just idx vs idx+1, so the index marches forward one step at a time and
+  // can NEVER leap to a far waypoint that merely sits near the unit. (Scanning the whole
+  // remaining path for the global nearest did exactly that on a curving/staircase road —
+  // a later node passes close, idx jumps to it, waypoints vanish off the front and the
+  // unit veers off-road chasing it, until the next replan resets it. That was the jitter.)
   const px = v.holder.position.x, pz = v.holder.position.z;
   while (nav.idx < nav.path.length - 1) {
-    const w = nav.path[nav.idx];
-    if ((w.x - px) ** 2 + (w.z - pz) ** 2 < (c * 1.3) ** 2) nav.idx++; else break;
+    const w = nav.path[nav.idx], nx = nav.path[nav.idx + 1];
+    const dCur = (w.x - px) ** 2 + (w.z - pz) ** 2;
+    if (dCur < (c * 1.2) ** 2) { nav.idx++; continue; }    // reached this waypoint
+    if ((nx.x - px) ** 2 + (nx.z - pz) ** 2 < dCur) { nav.idx++; continue; }   // driven past it (nearer the next)
+    break;
   }
   return nav.path[nav.idx];
 }
-// Steer a vehicle toward a world point: pivot in place when badly mis-aimed, else drive.
+// Steer a vehicle toward a world point. SQUARE UP before committing forward: pivot in
+// place when badly mis-aimed, ease in at part-throttle while lining up, and only run at
+// full speed once roughly on heading. The old 69° gate let a slow tank charge forward
+// at up to 69° off and arc straight into a gate jamb / wall corner instead of turning to
+// face the gap first. drive() still slides on the fine bit.
 function steerToward(v, wx, wz) {
   const dx = wx - v.holder.position.x, dz = wz - v.holder.position.z;
   const err = wrapPi(Math.atan2(-dx, -dz) - v.heading);
-  return { fwd: Math.abs(err) > 1.2 ? 0 : 1, turn: Math.max(-1, Math.min(1, err * 2.2)) };
+  const a = Math.abs(err);
+  const fwd = a > 0.6 ? 0 : a > 0.25 ? 0.45 : 1;   // >34° pivot in place; 14–34° crawl + turn; <14° full
+  // Small deadzone near zero so a unit that's basically on-heading drives STRAIGHT
+  // instead of micro-correcting left/right every frame (the "shaking its head" wobble).
+  const turn = a < 0.06 ? 0 : Math.max(-1, Math.min(1, err * 2.2));
+  return { fwd, turn };
 }
 
 class AICommander {
@@ -2045,12 +2080,17 @@ class AICommander {
   // substitute, else whatever we have most of, else null (roster empty → eliminated).
   _pickAvailableType(want) {
     if ((this.roster[want] || 0) > 0) return want;
-    const cls = HEAVY_TYPES.includes(want) ? HEAVY_TYPES : FAST_TYPES;
-    const sameClass = cls.filter(t => (this.roster[t] || 0) > 0);
-    if (sameClass.length) return sameClass[0];
+    // Substitute by ROLE, not raw speed. The Valkyrie is a base-ATTACKER (like the
+    // heavies); the Firebrat is the fragile flag RUNNER. The old by-speed grouping fell a
+    // dead-Valkyrie siege role back to a Firebrat (both "fast") and shoved a paper-thin
+    // runner into a tower duel — it got shredded. A wanted SIEGER substitutes another
+    // sieger (Jotun first, then Lurcher); a wanted runner has no real stand-in.
+    const pool = want === 'firebrat' ? [] : ['jotun', 'lurcher', 'valkyrie'];
+    const sub = pool.filter(t => t !== want && (this.roster[t] || 0) > 0);
+    if (sub.length) return sub[0];
     const any = Object.keys(this.roster).filter(t => (this.roster[t] || 0) > 0);
     if (!any.length) return null;
-    any.sort((a, b) => this.roster[b] - this.roster[a]);   // prefer the type we have most of
+    any.sort((a, b) => this.roster[b] - this.roster[a]);   // last resort (e.g. a firebrat-only fleet) — most numerous
     return any[0];
   }
   // A recon waypoint into unexplored map, held until the unit reaches it, then advanced
@@ -2068,21 +2108,25 @@ class AICommander {
     return this._exploreWp;
   }
 
+  // Log label = this team's palette colour name (PURPLE, CYAN…), so a log line reads
+  // as the colour the team actually wears on the field — clearer than a flavour name.
+  get cname() { return teamLabel(this.colorIndex); }
+
   // Draw a fresh card (on repeated losses / stalls) — keeps the AI unpredictable.
-  redraw() { this.strategy = makeDoctrine(this.archetype, this.personality, Math.random, this.strategy.constructor); this.fortHp0 = fortHpOf(this.targetTeam()) || this.fortHp0; this.targetTurrets0 = turretCountOf(this.targetTeam()); this.failStreak = 0; aiLog(this.team, `${this.personality.name} ${this.archetype ? 'regroups' : 'draws ' + (this.strategy.constructor.name || 'card').replace('Strategy', '')} (new plan)`); }
+  redraw() { this.strategy = makeDoctrine(this.archetype, this.personality, Math.random, this.strategy.constructor); this.fortHp0 = fortHpOf(this.targetTeam()) || this.fortHp0; this.targetTurrets0 = turretCountOf(this.targetTeam()); this.failStreak = 0; aiLog(this.team, `${this.cname} ${this.archetype ? 'regroups' : 'draws ' + (this.strategy.constructor.name || 'card').replace('Strategy', '')} (new plan)`); }
 
   deploy() {
     const want = this.strategy.wantVehicle(this);
     const type = this._pickAvailableType(want);
     if (!type) {                               // roster empty — this commander is out of the fight
       this.unit = null;
-      if (!this._eliminated) { this._eliminated = true; aiLog(this.team, `${this.personality.name} has no vehicles left`); }
+      if (!this._eliminated) { this._eliminated = true; aiLog(this.team, `${this.cname} has no vehicles left`); }
       return;
     }
     this._stepAtDeploy = this.strategy.step;   // lock the type for this step — no mid-step churn
     this._recalling = false;
     const sub = type !== want ? ` (out of ${want})` : '';
-    aiLog(this.team, `${this.personality.name} deploys ${type}${sub} — ${this.fleetLeft()} left`);
+    aiLog(this.team, `${this.cname} deploys ${type}${sub} — ${this.fleetLeft()} left`);
     const home = this.homePos();
     const v = new Vehicle(type); v.setScale(0.72);
     v.setCamo(this.colorIndex); v.setTeamColor(TEAM_COLORS[this.colorIndex].hex);
@@ -2151,8 +2195,8 @@ class AICommander {
     if (this._lastTowers == null) this._lastTowers = liveTowers;
     if (liveTowers < this._lastTowers) {
       aiLog(this.team, liveTowers === 0
-        ? `${this.personality.name}: enemy turrets CLEAR — breaching HQ`
-        : `${this.personality.name}: turret down — ${liveTowers} enemy turrets left`);
+        ? `${this.cname}: enemy turrets CLEAR — breaching HQ`
+        : `${this.cname}: turret down — ${liveTowers} enemy turrets left`);
       this._lastTowers = liveTowers;
     } else if (liveTowers > this._lastTowers) { this._lastTowers = liveTowers; }   // match reset
     // MOVEMENT HEALTH — the half the log was missing: it showed INTENT ("assault turret")
@@ -2171,7 +2215,7 @@ class AICommander {
         : 'wedged on terrain';
     }
     this._dbg = {
-      name: this.personality.name, type: v.type, state: cmd.state,
+      name: this.cname, type: v.type, state: cmd.state,
       stuck: this._stuckT > 0.8 ? +this._stuckT.toFixed(1) : 0, stuckWhy,
       card: (this.strategy.constructor.name || 'Card').replace('Strategy', ''),
       fwd: +cmd.fwd.toFixed(2), turn: +cmd.turn.toFixed(2),
@@ -2207,7 +2251,7 @@ class AICommander {
         case 'assault':  line = `sieging ${dest} (${this.turretsLive()} turrets left)`; break;
         default:         line = cmd.state;
       }
-      aiLog(this.team, `${this.personality.name} ${v.type}: ${line} [${card}]`);
+      aiLog(this.team, `${this.cname} ${v.type}: ${line} [${card}]`);
     }
   }
 
@@ -2226,10 +2270,22 @@ class AICommander {
     else if (st === 'retreat') dest = this._home;          // heal at own base (only place HP regens)
     else if (st === 'resupply') dest = this._supply;       // nearest fuel/ammo (own base or a depot)
     else if (st === 'assault') { dest = this.strategy.objective(this); slack = (view.engageRange || 36) * 0.7 * 1.25; }
-    else return;   // engage / suppress / unstick — leave the steering as-is
+    else { if (st === 'unstick') this._nav.path = null; return; }   // engage/suppress: steer as-is; unstick: drop the route so it replans fresh after the jolt (not straight back into the wall)
     if (!dest) return;
     const d2 = (dest.x - v.holder.position.x) ** 2 + (dest.z - v.holder.position.z) ** 2;
     if (d2 < slack * slack) return;                 // close enough — hand back to the behavior
+    // ESCALATION: when a unit has been genuinely stuck a long time (the local jolt + the
+    // routine replan didn't break it), the PATH itself is the problem — it keeps routing
+    // back into the same spot. So mark that spot impassable for a few seconds and replan
+    // a REAL way around it. This preserves a valid, obstacle-avoiding route (the old "skip
+    // ahead N nodes" just aimed at a far waypoint in a straight line, cutting across
+    // everything the path was avoiding — turning a good path into a bad one).
+    if (this._stuckT > NAV_BLOCK_AFTER) {
+      const hx = -Math.sin(v.heading), hz = -Math.cos(v.heading);
+      avoidCell(v.holder.position.x + hx * VEH_R, v.holder.position.z + hz * VEH_R);   // the obstacle right at the nose
+      this._nav.path = null;                         // force a replan that routes around it
+      this._stuckT = NAV_BLOCK_AFTER * 0.4;          // back off the timer (don't re-fire every tick; re-escalate if still stuck)
+    }
     const wp = navWaypoint(this._nav, v, dest, dt);
     if (!wp) return;                                // no route — keep the brain's command
     const s = steerToward(v, wp.x, wp.z);
@@ -2250,7 +2306,7 @@ class AICommander {
     if (this.unit.type === want) return;                           // new beat wants the same vehicle → carry on
     this._recalling = true; this._recallT = 22;                    // backstop: give up the trip after 22s
     this._nav.path = null;                                          // replan toward home
-    aiLog(this.team, `${this.personality.name} pulls ${this.unit.type} home to swap for ${want}`);
+    aiLog(this.team, `${this.cname} pulls ${this.unit.type} home to swap for ${want}`);
   }
 
   // Drive a recalled unit back to its FOB, then despawn it quietly (no explosion) so
@@ -2265,7 +2321,7 @@ class AICommander {
     const reach = (this._elev ? this._elev.padHalf : 8) + 5;
     this._recallT -= dt;
     if (d < reach || this._recallT <= 0) {
-      aiLog(this.team, `${this.personality.name} ${v.type} ${d < reach ? 'home — swapping' : 'recall timed out — swapping'}`);
+      aiLog(this.team, `${this.cname} ${v.type} ${d < reach ? 'home — swapping' : 'recall timed out — swapping'}`);
       removeCombatant(v); scene.remove(v.group); this.unit = null; this._recalling = false; this.respawnT = 1.0;
       return;
     }
@@ -2276,7 +2332,7 @@ class AICommander {
     v.drive(dt, out.fwd, out.turn, null, v._blocked);
     v.ai._wantMove = s.fwd > 0.3;
     this._dbg = {
-      name: this.personality.name, type: v.type, state: 'return-to-base',
+      name: this.cname, type: v.type, state: 'return-to-base',
       card: (this.strategy.constructor.name || 'Card').replace('Strategy', ''),
       fwd: +s.fwd.toFixed(2), turn: +s.turn.toFixed(2), blk: '···',
       hp: Math.round(v.hp / v.maxHp * 100), ammo: v.ammo, fuel: Math.round(v.fuel), distFob: Math.round(d),
@@ -2297,7 +2353,7 @@ class AICommander {
         if (this.unit.type === 'firebrat' && this.strategy.step === 'grab') {
           this.strategy.step = this.strategy.softenStep(); this.strategy.t = 0;
           this.targetTurrets0 = turretCountOf(this.targetTeam());
-          aiLog(this.team, `${this.personality.name} runner down — re-softening (towers still up)`);
+          aiLog(this.team, `${this.cname} runner down — re-softening (towers still up)`);
         }
         // Keep losing the same way? Each repeat raises the odds of a brand-new plan — but
         // only for legacy deck commanders. An archetype keeps its doctrine (losing a unit
@@ -2487,7 +2543,12 @@ class AICommander {
     }
     const fx = -Math.sin(h), fz = -Math.cos(h), lx = -Math.sin(h + 0.6), lz = -Math.cos(h + 0.6),
           rx = -Math.sin(h - 0.6), rz = -Math.cos(h - 0.6), P = 9;
-    const blockedAhead = v._blocked(px + fx * P, pz + fz * P);
+    // Sweep each feeler from the hull edge out to P, not just the far point — a single
+    // 9u sample sailed PAST a tree/wall the unit was already nosed into (so it never
+    // registered as blocked and the break-through never fired). Near + far catches both
+    // "about to hit it" and "already touching it".
+    const feeler = (ax, az) => v._blocked(px + ax * VEH_R, pz + az * VEH_R) || v._blocked(px + ax * P, pz + az * P);
+    const blockedAhead = feeler(fx, fz);
     // BREAK-THROUGH: when the nose is blocked, find the destructible dead ahead (the
     // nearest enemy/neutral WALL in front, else a TREE on the path) so a stuck ground
     // unit can shoot it out of the way instead of circling. Only the obstacles that
@@ -2499,6 +2560,7 @@ class AICommander {
       let best = null, bestD = reach * reach, ty = 2.0;
       for (const o of obstacles) {
         if (o.team === this.team) continue;            // never shoot our OWN base walls (the trigger-happy own-flag-shredding bug)
+        if (o.body && o.body.dead) continue;           // already rubble — nothing to shoot
         const ox = o.x - px, oz = o.z - pz;
         if (ox * fx + oz * fz <= 0) continue;          // behind the nose
         const d = ox * ox + oz * oz;
@@ -2523,8 +2585,8 @@ class AICommander {
       home: healHome || goal,
       shootGoal: this.strategy.shoot(this), arriveDist: this._intercepting ? 4 : this._shielding ? 6 : this.strategy.arriveDist(this),
       blockedAhead,
-      blockedLeft: v._blocked(px + lx * P, pz + lz * P),
-      blockedRight: v._blocked(px + rx * P, pz + rz * P),
+      blockedLeft: feeler(lx, lz),
+      blockedRight: feeler(rx, rz),
     };
   }
 }
@@ -2604,6 +2666,20 @@ function colorName(hex) {
   return best;
 }
 function flagColorName(f) { return colorName('#' + f.cloth.material.color.getHexString()); }
+// The palette NAME of a colour index (CYAN, PURPLE, GREY…) — the unambiguous team
+// label in the log, so a line's identity matches the team's actual on-field colour.
+function teamLabel(colorIndex) { const c = TEAM_COLORS[colorIndex]; return c ? c.name : '—'; }
+// Lighten a team colour so it stays legible on the dark log panel while keeping its hue
+// (the darker palette slots — RED, BLUE, PURPLE, GREY — are nearly black otherwise).
+function logTint(hex) {
+  let r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+  const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  if (lum < 150) { const k = 150 / Math.max(lum, 1); r = Math.min(255, r * k); g = Math.min(255, g * k); b = Math.min(255, b * k); }
+  const f = v => Math.round(v).toString(16).padStart(2, '0');
+  return '#' + f(r) + f(g) + f(b);
+}
+// A team's log colour: its real on-field tint, brightened for the panel.
+function teamLogColor(team) { return logTint(teamColor(team)); }
 function ensureCelebStyle() {
   if (document.getElementById('celeb-style')) return;
   const s = document.createElement('style'); s.id = 'celeb-style';
@@ -2726,15 +2802,15 @@ function updateAiLog() {
   let html = '';
   for (const cmd of commanders) {
     const d = cmd._dbg;
-    const col = TEAM_ACCENT[cmd.team] || '#aaa';
-    if (!d) { html += `<span style="color:${col}">${cmd.team}</span> — deploying…\n`; continue; }
-    html += `<span style="color:${col}">${d.name} ${d.type}</span> ${d.card}  enemyTwrs:${d.towers}\n`;
+    const col = teamLogColor(cmd.team);
+    if (!d) { html += `<span style="color:${col}">${cmd.cname} — deploying…</span>\n`; continue; }
+    html += `<span style="color:${col}">${d.name} ${d.type} ${d.card}  enemyTwrs:${d.towers}\n`;
     html += `  ${d.state}  blk:${d.blk}  f/t:${d.fwd}/${d.turn}\n`;
-    if (d.stuck) html += `  <span style="color:#ff8a5a">⚠ STUCK ${d.stuck}s — ${d.stuckWhy}</span>\n`;
-    html += `  hp:${d.hp}% ammo:${d.ammo} fuel:${d.fuel}  fob:${d.distFob}u\n`;
+    if (d.stuck) html += `  ⚠ STUCK ${d.stuck}s — ${d.stuckWhy}\n`;
+    html += `  hp:${d.hp}% ammo:${d.ammo} fuel:${d.fuel}  fob:${d.distFob}u</span>\n`;
   }
   html += '<span style="opacity:0.55">────────────</span>\n';
-  const line = e => `<span style="opacity:0.8">${e.t.toFixed(0)}s</span> <span style="color:${TEAM_ACCENT[e.team] || '#aaa'}">${e.msg}</span>\n`;
+  const line = e => `<span style="opacity:0.8">${e.t.toFixed(0)}s</span> <span style="color:${teamLogColor(e.team)}">${e.msg}</span>\n`;
   if (aiLogMode === 'brief') {
     // Brief: the single most-recent event from EACH team (one line per commander),
     // shown in team order so it doesn't flip around as events come in.
@@ -2778,6 +2854,7 @@ function hasLOS(ax, az, bx, bz) {
   for (let s = 1; s < steps; s++) {
     const t = s / steps, x = ax + dx * t, z = az + dz * t;
     for (const o of obstacles) {
+      if (o.body && o.body.dead) continue;           // a downed wall no longer blocks line of sight
       const ox = x - o.x, oz = z - o.z;
       if (ox * ox + oz * oz < o.r * o.r) return false;
     }
@@ -2788,26 +2865,35 @@ function hasLOS(ax, az, bx, bz) {
 // --- Collision ---------------------------------------------------------
 // Solid wall pieces the player can't drive through (gates excluded — drive-through).
 let obstacles = [];           // { x, z, r }
-const gateCells = new Set();  // grid cells the A* navigator treats as always-open (gate corridors)
+const gateCells = new Set();  // grid cells the A* navigator treats as always-open + cheap (gate centre lane)
+const gateSideCells = new Set();  // the gate's flanking cells — open to the eye but a full-radius vehicle scrapes the jamb there, so A* must NOT use them
 let islandBound = 0;          // radius (from map centre) past which no vehicle may go
 function buildObstacles() {
   obstacles = [];
   gateCells.clear();
+  gateSideCells.clear();
   const c0 = grid.cell;
   for (const c of camps) for (const w of c.walls) {
     if (w.type && w.type.startsWith('GATE')) {
-      // Carve a passable corridor through the opening: the gate cell + a few cells
-      // along its outward normal (in/out), so A* can thread the gap the inflated
-      // wall obstacles would otherwise seal.
+      // The gate opening is 3 cells wide, but a full-radius vehicle can only clear
+      // it dead-centre (the flanking lanes scrape the wall the inflated obstacles
+      // don't quite reach with the gentle nav margin). So carve a SINGLE-FILE centre
+      // throat: open + road-cheap down the middle, and explicitly block the side
+      // lanes through the gate plane so A* threads the centre instead of the jamb.
       const gx = w.group.position.x, gz = w.group.position.z;
       const gi = Math.round(gx / c0), gj = Math.round(gz / c0);
       const dx = gx - c.center.x, dz = gz - c.center.z;
       const sx = Math.abs(dx) >= Math.abs(dz) ? Math.sign(dx) : 0;
       const sz = Math.abs(dx) >= Math.abs(dz) ? 0 : Math.sign(dz);
-      for (let k = -2; k <= 2; k++) gateCells.add((gi + sx * k) + ',' + (gj + sz * k));
+      const px = sx !== 0 ? 0 : 1, pz = sx !== 0 ? 1 : 0;   // along-the-wall (perpendicular to the normal)
+      for (let k = -2; k <= 2; k++) {
+        gateCells.add((gi + sx * k) + ',' + (gj + sz * k));
+        if (k >= -1 && k <= 1)
+          for (const s of [-1, 1]) gateSideCells.add((gi + sx * k + px * s) + ',' + (gj + sz * k + pz * s));
+      }
       continue;
     }
-    obstacles.push({ x: w.group.position.x, z: w.group.position.z, team: c.team,
+    obstacles.push({ x: w.group.position.x, z: w.group.position.z, team: c.team, body: w.body,
                      r: w.type === 'CORNER' ? grid.cell * 0.7 : grid.cell * 0.5 });
   }
   // Soft world edge: a ring ~70u beyond the outermost base. Keeps flyers (which
@@ -3518,7 +3604,9 @@ window.RR = {
   celebrate: (kind = 'victory', team = PLAYER_TEAM) => kind === 'defeat' ? playDefeat() : playVictory(team),
   navPlan: (v, x, z) => planPath(v, { x, z }),                 // debug: A* path for a unit
   navCellBlocked: (v, i, j) => cellBlocked(v, i, j),          // debug: nav passability of a cell
+  avoidCell: (x, z) => avoidCell(x, z),                       // debug: blacklist a cell (stuck-escalation)
   get gateCells() { return [...gateCells]; },
+  get gateSideCells() { return [...gateSideCells]; },
   get aiEvents() { return aiEvents.slice(); },                 // debug: the rolling AI decision log (headless can't read the DOM overlay)
   exploreFrac: (i = 0) => { const c = commanders[i]; return c && c.explore ? c.explore.fraction() : null; },   // debug: fraction of map this team has scouted
   exploreWp: (i = 0) => { const c = commanders[i]; return c ? c._exploreWp : null; },                          // debug: current recon waypoint
@@ -3626,6 +3714,70 @@ const perfEl = document.getElementById('perf');
 let fpsEma = 60, perfTick = 0;
 
 const clock = new THREE.Clock();
+// --- A* path overlay (?nav) -------------------------------------------
+// Draws each AI unit's CACHED route (commander._nav.path) as a ground line in the team
+// colour, a bright dot on the current target waypoint, and a cone on the destination.
+// Pure visualisation of data the navigator already stores — no extra pathfinding. Runs
+// live and KEEPS drawing while the sim is paused (full-screen log), so you can freeze a
+// wedged unit and read exactly where its path is sending it (e.g. a line into the sea).
+const NAV_DEBUG = QS.has('nav');
+let navLines = null;   // Map<commander, {line, posAttr, wp, dest}>
+function _makeNavObj() {
+  const geo = new THREE.BufferGeometry();
+  const posAttr = new THREE.BufferAttribute(new Float32Array(256 * 3), 3);
+  posAttr.setUsage(THREE.DynamicDrawUsage);
+  geo.setAttribute('position', posAttr);
+  const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ depthTest: false, transparent: true, opacity: 0.95 }));
+  line.frustumCulled = false; line.renderOrder = 998;
+  const wp = new THREE.Mesh(new THREE.SphereGeometry(0.9, 10, 10), new THREE.MeshBasicMaterial({ color: '#ffe24a', depthTest: false }));
+  wp.renderOrder = 999;
+  const dest = new THREE.Mesh(new THREE.ConeGeometry(1.5, 4.5, 10), new THREE.MeshBasicMaterial({ depthTest: false, transparent: true, opacity: 0.85 }));
+  dest.rotation.x = Math.PI;   // apex points DOWN at the destination cell
+  dest.renderOrder = 999;
+  scene.add(line); scene.add(wp); scene.add(dest);
+  return { line, posAttr, wp, dest };
+}
+function updateNavOverlay() {
+  if (!NAV_DEBUG) return;
+  if (!navLines) navLines = new Map();
+  for (const o of navLines.values()) { o.line.visible = false; o.wp.visible = false; o.dest.visible = false; }
+  if (!onField) return;
+  for (const cmd of commanders) {
+    const v = cmd.unit, nav = cmd._nav;
+    if (!v || v.dead || !nav || !nav.path || !nav.path.length) continue;
+    let o = navLines.get(cmd);
+    if (!o) { o = _makeNavObj(); navLines.set(cmd, o); }
+    const col = new THREE.Color(teamColor(cmd.team));
+    o.line.material.color.copy(col); o.dest.material.color.copy(col);
+    const pts = nav.path, arr = o.posAttr.array;
+    let n = 0;
+    const add = (x, z) => { if (n >= 256) return; arr[n * 3] = x; arr[n * 3 + 1] = map.heightAt(x, z) + 1.3; arr[n * 3 + 2] = z; n++; };
+    add(v.holder.position.x, v.holder.position.z);          // start the line at the unit itself
+    // …then only the REMAINING route (from the current target onward). Drawing from
+    // index 0 looped back to the path's original start — already behind the unit — which
+    // read as the line "going backwards" before heading for the dot.
+    for (let i = Math.min(nav.idx, pts.length - 1); i < pts.length; i++) add(pts[i].x, pts[i].z);
+    o.posAttr.needsUpdate = true;
+    o.line.geometry.setDrawRange(0, n);
+    o.line.visible = true;
+    // Dot = the next BEND in the route (or the destination), not the per-tick look-ahead
+    // cell. The look-ahead point slides ~1 cell ahead of the unit every frame and looked
+    // frantic; a bend is a stable landmark — it holds while the unit drives the straight
+    // toward it, then hops to the next corner once passed.
+    let bi = pts.length - 1;
+    const start = Math.min(nav.idx, pts.length - 2);
+    if (start >= 0) {
+      const seg = i => Math.sign(pts[i + 1].x - pts[i].x) + ',' + Math.sign(pts[i + 1].z - pts[i].z);
+      const d0 = seg(start);
+      for (let i = start + 1; i <= pts.length - 2; i++) { if (seg(i) !== d0) { bi = i; break; } }
+    }
+    const w = pts[Math.min(bi, pts.length - 1)];             // the next turn the unit is driving toward
+    o.wp.position.set(w.x, map.heightAt(w.x, w.z) + 1.6, w.z); o.wp.visible = true;
+    const dp = pts[pts.length - 1];                          // the route's end (its destination)
+    o.dest.position.set(dp.x, map.heightAt(dp.x, dp.z) + 3.2, dp.z); o.dest.visible = true;
+  }
+}
+
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(0.05, clock.getDelta());
@@ -3668,6 +3820,7 @@ function animate() {
       updateEngineSounds();                  // spatial enemy/AI engine noise (distance-based)
     }
     updateAiLog();                         // AI decision overlay (renders even while paused)
+    updateNavOverlay();                    // ?nav: draw each unit's A* path (also while paused)
     renderer.render(scene, camera);
     if (fade) {
       if (returning && victoryReturn) {
