@@ -766,6 +766,9 @@ const VEH_STATS = {
 };
 const SINK_RATE = 1.2;     // units/sec a land vehicle floods when over water
 const SINK_KILL = 2.5;     // depth at which it's fully submerged → destroyed
+const WADE_MIN = 0.25;     // fording draft below the waterline AT the shore (just dips in)
+const WADE_MAX = 1.6;      // draft in the deepest fordable water (mostly under, top still shows);
+                           // the opaque water-coloured terrain hides the submerged hull
 const TREE_BUMP_DMG = 12;  // HP a light vehicle loses ramming a palm
 
 let fireCooldown = 0;
@@ -1324,6 +1327,31 @@ function spawnExplosion(point, big) {
     dispose() { geo.dispose(); mat.dispose(); } });
 }
 
+// Soft white radial alpha (foam core → clear edge) for wake puffs, baked once.
+let _foamTex = null;
+function foamTex() {
+  if (_foamTex) return _foamTex;
+  const s = 64, cv = document.createElement('canvas'); cv.width = cv.height = s;
+  const g = cv.getContext('2d');
+  const grd = g.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
+  grd.addColorStop(0, '#ffffff'); grd.addColorStop(0.5, '#9a9a9a'); grd.addColorStop(1, '#000000');
+  g.fillStyle = grd; g.fillRect(0, 0, s, s);
+  _foamTex = new THREE.CanvasTexture(cv);
+  return _foamTex;
+}
+// One flat white foam puff on the water surface; it expands and fades like turbulence.
+function spawnWake(x, y, z, r0) {
+  const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5,
+    alphaMap: foamTex(), depthWrite: false });
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+  m.rotation.x = -Math.PI / 2;
+  m.position.set(x, y, z);
+  scene.add(m);
+  fx.push({ obj: m, life: 0.8, max: 0.8,
+    update(dt, k) { m.scale.setScalar(r0 * (0.6 + (1 - k) * 1.8)); mat.opacity = 0.5 * k; },
+    dispose() { m.geometry.dispose(); mat.dispose(); } });
+}
+
 function updateFx(dt) {
   for (let i = fx.length - 1; i >= 0; i--) {
     const f = fx[i]; f.life -= dt;
@@ -1399,16 +1427,28 @@ function blockedFor(move, avoidWater) {
   };
 }
 
-// Deck height of a BRIDGE (a road cell that runs over water) at a world point, or null
-// if (x,z) isn't on one. A land road follows the terrain normally; only the over-water
-// span is a raised deck — vehicles ride it instead of wading/sinking beneath it. Must
-// match the grade Roads.js builds the deck at (bridgeY there).
-function bridgeDeckY(x, z) {
+// Top surface height of a ROAD cell at a world point, or null if (x,z) isn't on one.
+// A road is a raised surface — a flat asphalt slab on land, a plank deck over water —
+// so vehicles ride its top instead of sinking into the slab / wading under the planks.
+// Must match the grade Roads.js builds each tile at (see tile()/deck() there).
+function roadDeckY(x, z) {
   if (!roadNet || !roadNet.cells) return null;
   const cx = Math.round(x / grid.cell), cz = Math.round(z / grid.cell);
-  if (!roadNet.cells.has(cx + ',' + cz)) return null;
-  if (map.isLand(x, z)) return null;
-  return (map.params.flatLand ? map.params.beachHeight + 0.8 : map.params.beachHeight + 0.5) + 0.08;
+  const cell = roadNet.cells.get(cx + ',' + cz);
+  if (!cell) return null;
+  const p = map.params;
+  if (!map.isLand(x, z)) {
+    // Over-water span: a plank deck seated at Math.max(cell grade, bridgeY) with its top
+    // ~0.08 above the centre. The old flat bridgeY ignored the per-cell grade, so where the
+    // road sat higher the deck was built above the vehicle's target and it sank through.
+    const bridgeY = p.flatLand ? p.beachHeight + 0.8 : p.beachHeight + 0.5;
+    return Math.max(cell.y, bridgeY) + 0.08;
+  }
+  // Land tile: a flat asphalt slab whose top sits 0.06 above its grade (tile(): topY =
+  // gradeY + 0.06). Flat-land roads share ONE grade (the plateau); the legacy hilly map
+  // falls back to each cell's own terrain height — same choice Roads.build() makes.
+  const roadGrade = p.flatLand ? p.beachHeight + 0.8 : cell.y;
+  return roadGrade + 0.06;
 }
 
 // Resolve altitude + water flooding for a vehicle, and crush/bump trees it touches.
@@ -1419,29 +1459,53 @@ function applyAltitude(veh, dt) {
   const terrain = deck ? deck.groundY : map.heightAt(x, z);
   const overWater = !deck && !map.isLand(x, z);
   const deepWater = !deck && map.isDeepWater(x, z);   // only the deep part drowns a sinker
+  // A road cell (land slab or over-water plank) is a raised surface — ride its top instead
+  // of the terrain/water beneath it. Elevator decks and true flyers (ignoreWalls) opt out.
+  const roadY = (deck || m.ignoreWalls) ? null : roadDeckY(x, z);
   let target;
   if (m.water === 'sink') {
-    const bridgeY = deck ? null : bridgeDeckY(x, z);   // on a bridge → ride the deck across the water
-    if (bridgeY != null) {
+    if (roadY != null) {
       veh._sink = Math.max(0, veh._sink - dt * SINK_RATE * 1.6);
-      target = bridgeY - veh._sink;
+      target = roadY - veh._sink;
     } else if (deepWater) {
       veh._sink += dt * SINK_RATE;
       target = -veh._sink;
       if (veh._sink >= SINK_KILL) { destroyVehicle(veh, 'sank'); return; }
     } else {
-      // land OR shallow water → ride the actual floor (negative in shallow water, so
-      // the hull sits partly submerged and reads as WADING, not floating on top),
-      // bleeding off any sink it built up wading out of the deep.
+      // land OR shallow water. On land, sit just above the ground. FORDING, sink below the
+      // waterline — DEEPER the bluer (deeper) the water — so it reads as riding the surface and
+      // wading in, the opaque water-coloured terrain hiding the submerged hull (no water plane
+      // exists to do it). Capped short of the drown depth so the top always shows.
       veh._sink = Math.max(0, veh._sink - dt * SINK_RATE * 1.6);
       const floor = deck ? deck.groundY : map.floorAt(x, z);
-      target = floor + 0.05 - veh._sink;
+      if (overWater) {
+        const f = Math.min(1, Math.max(0, -floor) / 0.8);   // 0 at shore → 1 at the ford limit (FORD_DEPTH = -0.8)
+        target = -(WADE_MIN + f * (WADE_MAX - WADE_MIN)) - veh._sink;
+      } else {
+        target = floor + 0.05 - veh._sink;
+      }
     }
   } else {
-    const base = overWater ? 0 : terrain;
+    // A hover craft (firebrat) on a road rides above its surface, not the terrain/water
+    // beneath it; a true flyer (valkyrie, ignoreWalls) just cruises over everything.
+    const base = roadY != null ? roadY : (overWater ? 0 : terrain);
     target = base + m.cruise;
   }
   veh.holder.position.y += (target - veh.holder.position.y) * Math.min(1, dt * 5);
+
+  // Wake: while a ground (sinker) vehicle fords open water and is actually moving, trail
+  // expanding white foam puffs behind it on the water surface.
+  if (m.water === 'sink' && overWater && roadY == null) {
+    const sp = Math.hypot(veh._vx || 0, veh._vz || 0);
+    if (sp > 2) {
+      veh._wakeT = (veh._wakeT || 0) - dt;
+      if (veh._wakeT <= 0) {
+        veh._wakeT = 0.06;   // ~16 puffs/sec while moving
+        const inv = veh.hitR / sp, bx = x - veh._vx * inv, bz = z - veh._vz * inv;   // one hull-radius behind
+        if (!map.isLand(bx, bz)) spawnWake(bx, map.floorAt(bx, bz) + 0.1, bz, veh.hitR * 0.45);
+      }
+    }
+  }
 
   // Trees in contact: heavy vehicles flatten them; light ones chip themselves.
   if (m.tree !== 'fly' && foliage) {
@@ -3622,6 +3686,8 @@ window.RR = {
   // Preview the end-of-match cinematic without playing a whole round.
   celebrate: (kind = 'victory', team = PLAYER_TEAM) => kind === 'defeat' ? playDefeat() : playVictory(team),
   teamColorName: (t) => teamColorName(t),                     // debug: a team's palette colour name (win banner)
+  roadDeckY: (x, z) => roadDeckY(x, z),                       // debug: road/bridge surface height, or null
+  bridgeDeckY: (x, z) => roadDeckY(x, z),                     // alias (kept for older verification scripts)
   navPlan: (v, x, z) => planPath(v, { x, z }),                 // debug: A* path for a unit
   navCellBlocked: (v, i, j) => cellBlocked(v, i, j),          // debug: nav passability of a cell
   avoidCell: (x, z) => avoidCell(x, z),                       // debug: blacklist a cell (stuck-escalation)
