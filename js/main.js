@@ -2530,8 +2530,10 @@ class AICommander {
       card: (this.strategy.constructor.name || 'Card').replace('Strategy', ''),
       fwd: +cmd.fwd.toFixed(2), turn: +cmd.turn.toFixed(2),
       blk: (view.blockedLeft ? 'L' : '·') + (view.blockedAhead ? 'A' : '·') + (view.blockedRight ? 'R' : '·'),
-      hp: Math.round(v.hp / v.maxHp * 100), ammo: v.ammo, fuel: Math.round(v.fuel),
+      hp: Math.round(v.hp / v.maxHp * 100), ammo: v.ammo, fuel: Math.round(v.fuel), shield: Math.round(v.shield),
       distFob: Math.round(Math.hypot(v.holder.position.x - fob.x, v.holder.position.z - fob.z)),
+      px: Math.round(v.holder.position.x), pz: Math.round(v.holder.position.z),
+      gx: view.goal ? Math.round(view.goal.x) : null, gz: view.goal ? Math.round(view.goal.z) : null,
       towers: this.turretsLive(),   // enemy turrets still standing (tower-first ordering)
     };
     if (cmd.state !== prev) {
@@ -2956,7 +2958,12 @@ class AICommander {
       resupply: supply ? { x: supply.center.x, z: supply.center.z } : goal,
       supplyHeals,   // the chosen resupply point is an own base → hold until ammo+fuel+hp are all maxed
       home: healHome || goal,
-      shootGoal: this.strategy.shoot(this), arriveDist: this._intercepting ? 4 : this._shielding ? 6 : this.strategy.arriveDist(this),
+      // While DETOURING (grabbing a shield / intercepting), the goal is a place to GO, not a
+      // thing to shell — so suppress shootGoal or the unit would "assault" (and gun down) the
+      // shield generator / intercept spot it's heading for. It still engages real enemies via
+      // the combat transitions; this only stops it firing at the detour waypoint.
+      shootGoal: this.strategy.shoot(this) && !this._shielding && !this._intercepting,
+      arriveDist: this._intercepting ? 4 : this._shielding ? 6 : this.strategy.arriveDist(this),
       // Is this unit on a flee-contact RUNNER mission (grab the flag / scout — avoid fights)
       // vs one the commander sent it out to FIGHT on (attack/siege/defend/intercept)? Gates
       // the Firebrat's runnerFlee reflex so an ordered-to-engage Firebrat actually closes +
@@ -3183,13 +3190,15 @@ function ensureAiLogEl() {
   el = document.createElement('div'); el.id = 'ai-log';
   el.innerHTML =
     '<div id="ai-log-head"><span id="ai-log-title">AI LOG</span>' +
-    '<span id="ai-log-btns"><span class="lg-btn" data-act="minus">–</span>' +
+    '<span id="ai-log-btns"><span class="lg-btn" data-act="export" title="Copy a snapshot to share">⧉</span>' +
+    '<span class="lg-btn" data-act="minus">–</span>' +
     '<span class="lg-btn" data-act="plus">+</span></span></div>' +
     '<div id="ai-log-body"></div>';
   el.addEventListener('pointerdown', e => {
     const b = e.target.closest('.lg-btn'); if (!b) return;
     e.preventDefault(); e.stopPropagation();
-    if (b.dataset.act === 'minus') setLogMode(aiLogMode === 'full' ? 'brief' : 'hidden');
+    if (b.dataset.act === 'export') exportLog();
+    else if (b.dataset.act === 'minus') setLogMode(aiLogMode === 'full' ? 'brief' : 'hidden');
     else setLogMode('full');
   });
   document.body.appendChild(el);
@@ -3251,6 +3260,84 @@ function updateAiLog() {
     html += `</div>`;
   }
   document.getElementById('ai-log-body').innerHTML = html;
+}
+
+// Build a plain-text snapshot of the whole AI state — per-team status (mission, goal,
+// hp/ammo/fuel, position) + the full recent event feed — for the player to copy and paste
+// when they spot odd behaviour (saves typing it all out). Read-only; safe to call anytime.
+function buildLogExport() {
+  const ver = (((document.querySelector('script[src*="main.js"]') || {}).src || '').match(/v=(\d+)/) || [])[1] || '?';
+  const human = TEAM_CTRL[PLAYER_TEAM] === 'human';
+  const t = ((performance.now() - _t0) / 1000).toFixed(0);
+  let s = `=== RIPOSTE RUN LOG (v${ver}) ===\nmode: ${human ? 'Player vs AI' : 'AI vs AI'}   t: ${t}s\n`;
+  if (player && !player.dead) {
+    const pp = player.holder.position;
+    s += `player: ${player.type} hp ${Math.round(player.hp / player.maxHp * 100)}% ammo ${player.ammo} @ (${Math.round(pp.x)},${Math.round(pp.z)})\n`;
+  }
+  for (const cmd of commanders) {
+    const d = cmd._dbg;
+    const mission = ((cmd.strategy && cmd.strategy.step) || '—').toUpperCase();
+    const known = cmd._knownSummary ? cmd._knownSummary() : 'none';
+    const goalLbl = cmd._intercepting ? 'intercept runner' : cmd._shielding ? 'grab shield'
+      : (cmd.strategy && cmd.strategy.objectiveLabel ? cmd.strategy.objectiveLabel(cmd) : '—');
+    s += `\n[${cmd.cname}] ${d ? d.type : 'deploying'} · ${mission}${d ? ` [${d.card}]` : ''}\n`;
+    if (d) {
+      s += `  ${d.state} → ${goalLbl}\n`;
+      s += `  hp ${d.hp}% ammo ${d.ammo} fuel ${d.fuel} shld ${d.shield}\n`;
+      s += `  pos (${d.px},${d.pz}) goal (${d.gx},${d.gz}) fob ${d.distFob}u blk ${d.blk} f/t ${d.fwd}/${d.turn}\n`;
+      if (d.stuck) s += `  STUCK ${d.stuck}s — ${d.stuckWhy}\n`;
+    }
+    s += `  enemy twrs ${d ? d.towers : '?'} · knows ${known} · fleet ${fleetStr(cmd)}\n`;
+  }
+  s += `\n--- events (newest first) ---\n`;
+  for (let i = aiEvents.length - 1; i >= 0; i--) s += `${aiEvents[i].t.toFixed(0)}s ${aiEvents[i].msg}\n`;
+  return s;
+}
+// Copy the snapshot to the clipboard; always also pop a selectable overlay (the secure
+// clipboard API is blocked on plain http, e.g. the phone over duckdns, so the overlay is
+// the reliable fallback — pre-selected text + a Copy button using the legacy execCommand).
+function exportLog() {
+  const txt = buildLogExport();
+  let copied = false;
+  try { if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(txt); copied = true; } } catch (e) { /* http → fall back to overlay */ }
+  showExportOverlay(txt, copied);
+}
+function showExportOverlay(txt, copied) {
+  let ov = document.getElementById('log-export');
+  if (!ov) {
+    ov = document.createElement('div'); ov.id = 'log-export';
+    ov.style.cssText = 'position:fixed;inset:0;z-index:400;background:rgba(0,0,0,0.85);display:flex;flex-direction:column;padding:14px;gap:10px;';
+    ov.innerHTML = '<div style="display:flex;gap:8px;align-items:center;font-family:\'Courier New\',monospace">'
+      + '<span id="lx-status" style="color:#dfe8ef;font-size:13px;flex:1"></span>'
+      + '<span id="lx-copy" class="lx-b">Copy</span><span id="lx-close" class="lx-b">Close</span></div>'
+      + '<textarea id="lx-text" readonly></textarea>';
+    document.body.appendChild(ov);
+    const style = document.createElement('style');
+    style.textContent = '#log-export .lx-b{padding:9px 16px;border:1px solid #567;border-radius:6px;color:#dfe8ef;'
+      + 'background:rgba(255,255,255,0.1);font:bold 13px "Courier New",monospace;cursor:pointer;'
+      + 'user-select:none;-webkit-user-select:none;touch-action:manipulation}'
+      + '#log-export .lx-b:active{background:rgba(255,255,255,0.25)}'
+      + '#lx-text{flex:1;width:100%;background:#0b0f14;color:#cfe3ef;border:1px solid #2c3a47;border-radius:6px;'
+      + 'padding:8px;font:11px/1.4 "Courier New",monospace;white-space:pre;-webkit-user-select:text;user-select:text}';
+    document.head.appendChild(style);
+    ov.addEventListener('pointerdown', e => {
+      if (e.target.id === 'lx-close') { e.preventDefault(); ov.style.display = 'none'; }
+      else if (e.target.id === 'lx-copy') {
+        e.preventDefault();
+        const ta = document.getElementById('lx-text');
+        ta.focus(); ta.select(); try { ta.setSelectionRange(0, ta.value.length); } catch (e2) {}
+        let ok = false;
+        try { ok = document.execCommand('copy'); } catch (e3) {}
+        if (!ok) { try { navigator.clipboard.writeText(ta.value); ok = true; } catch (e4) {} }
+        document.getElementById('lx-status').textContent = ok ? '✓ Copied — paste it to Claude' : 'Select the text above, then copy';
+      }
+    });
+  }
+  ov.style.display = 'flex';
+  const ta = document.getElementById('lx-text');
+  ta.value = txt;
+  document.getElementById('lx-status').textContent = copied ? '✓ Copied — paste it to Claude' : 'Tap Copy, then paste it to Claude';
+  setTimeout(() => { try { ta.focus(); ta.select(); } catch (e) {} }, 30);
 }
 
 // A flag was carried home → that team wins. Freeze the field, announce, then reset
