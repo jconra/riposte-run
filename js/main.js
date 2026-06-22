@@ -17,7 +17,7 @@ import { TEAM_COLORS, updateCamo, camoParams } from '../../vehicle-designer/js/C
 import { SoundManager } from '../../vehicle-designer/js/SoundManager.js';
 import { Projectiles } from '../../vehicle-designer/js/Projectiles.js';
 import { Brain, randomPersonality } from './AI.js?v=71';
-import { makeDoctrine, pickArchetype, assignArchetypes, COUNTER } from './AIStrategies.js?v=60';
+import { makeDoctrine, pickArchetype, assignArchetypes, COUNTER } from './AIStrategies.js?v=62';
 import { ExploreMemory } from './ExploreMemory.js?v=54';
 import { astarGrid } from './astar.js';
 import { makeFuelTank, makeAmmoDepot, makeShieldGenerator, makeShieldBubble, RESUPPLY_TINT } from './Resupply.js';
@@ -1818,9 +1818,16 @@ function reshield(v, dt) {
   ensureShieldFx(v);
   if (v.isPlayer) updatePlayerHud();
 }
+// A flag base resupplies only while its HQ still stands — once the building is rubble
+// (flag exposed) the wreckage can't rearm/refuel/heal anyone. The FOB (elevator) is a
+// separate structure and keeps working.
+function flagBaseAlive(team) {
+  const f = flags.find(fl => fl.team === team);
+  return !(f && f.hqBody && f.hqBody.dead);
+}
 function nearOwnSupply(v, vx, vz) {
   const main = teamCamp(v.team, 'main'), fob = teamCamp(v.team, 'fob');
-  if (main && Math.hypot(vx - main.center.x, vz - main.center.z) < 16) return true;
+  if (main && flagBaseAlive(v.team) && Math.hypot(vx - main.center.x, vz - main.center.z) < 16) return true;
   if (fob && Math.hypot(vx - fob.center.x, vz - fob.center.z) < 12) return true;
   return false;
 }
@@ -2044,6 +2051,12 @@ class AICommander {
   homeBasePos() { return teamCenter(this.team, 'main'); }           // our own flag base
   // Have we ever laid eyes on an enemy vehicle? (drives Hunter scout → attack)
   knowsEnemy() { return Object.keys(this.seenTypes).length > 0; }
+  // The enemy's last-known position, if seen recently (else null → fall back to the
+  // elevator). Lets the Attack mission "recall the last known location" (ai_behavior).
+  lastEnemyPos() {
+    const s = this._lastEnemyPos;
+    return s && (performance.now() - s.t) < 12000 ? { x: s.x, z: s.z } : null;
+  }
   // Is the target team out of the fight for good — no live unit AND its commander is
   // eliminated? (A human team has no commander and can always redeploy, so never "out".)
   // Lets a mission like the Hunter's hunt END instead of firing at an empty elevator.
@@ -2096,6 +2109,9 @@ class AICommander {
   // Our OWN flag (the one a rival steals). ourFlagStolen → a live enemy is carrying it.
   ourFlag() { return flags.find(f => f.team === this.team) || null; }
   ourFlagStolen() { const f = this.ourFlag(); return !!(f && f.carried && f.carrier && !f.carrier.dead && f.carrier.team !== this.team); }
+  // Our flag base has lost all its turrets → a defender can't lean on tower cover and
+  // should switch to a Valkyrie's mobility (ai_behavior Defend).
+  ownTowersDown() { return turretCountOf(this.team) === 0; }
   // DEFEND intercept point (ai_behavior): chase the carrier directly; if it's somehow
   // out of play fall back to the enemy's elevator — where they must take it to score.
   interceptSpot() {
@@ -2503,6 +2519,9 @@ class AICommander {
           hpFrac: o.maxHp ? o.hp / o.maxHp : 1, retreating: o._aiState === 'retreat' || o._aiState === 'resupply' }; seen = o; seesEnemy = true;
       }
     }
+    // Remember WHERE the enemy was last seen (team-shared) so the Attack mission can recall
+    // their last-known position instead of only marching to the fixed elevator (ai_behavior).
+    if (seen) this._lastEnemyPos = { x: enemy.x, z: enemy.z, t: performance.now() };
     // Fog-of-war intel: remember what the enemy keeps fielding so counterVehicle() works.
     if (seen) this.seenTypes[seen.type] = (this.seenTypes[seen.type] || 0) + 1;
     // DISCOVER nearby supply points — the team only "knows" a depot once one of its
@@ -2550,7 +2569,7 @@ class AICommander {
     // isBase = an OWN base (restocks fuel + ammo AND patches the hull); a depot does not.
     const consider = (x, z, isBase) => { const d = (px - x) ** 2 + (pz - z) ** 2; if (d < bestD) { bestD = d; supply = { center: { x, z } }; supplyHeals = isBase; } };
     if (fob) consider(fob.center.x, fob.center.z, true);
-    if (home) consider(home.center.x, home.center.z, true);
+    if (home && flagBaseAlive(this.team)) consider(home.center.x, home.center.z, true);   // a levelled flag base resupplies no one
     // A neutral depot is only worth the detour if topping its one resource fully clears
     // the latch — i.e. it's the single low resource. Both low → base only (above).
     const depotKind = (lowAmmo && !lowFuel) ? 'ammo' : (lowFuel && !lowAmmo) ? 'fuel' : null;
@@ -2563,7 +2582,7 @@ class AICommander {
     let healHome = null, healD = Infinity;
     const considerHome = (x, z) => { const d = (px - x) ** 2 + (pz - z) ** 2; if (d < healD) { healD = d; healHome = { x, z }; } };
     if (fob) considerHome(fob.center.x, fob.center.z);
-    if (home) considerHome(home.center.x, home.center.z);
+    if (home && flagBaseAlive(this.team)) considerHome(home.center.x, home.center.z);   // can't heal at a destroyed flag base
     this._home = healHome;
     // Post-deploy: drive OUT through the gate first. mustGo forces the brain to head
     // straight for the exit waypoint (no engaging/firing) until it clears the gate.

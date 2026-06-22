@@ -51,12 +51,13 @@ class Scout extends Mission {
   label(cmd) { return 'sweeping for recon'; }
 }
 
-// ATTACK — hunt the enemy's vehicles where they emerge, kill what comes out.
+// ATTACK — recall the enemy's last-known position and hunt them down; with no recent
+// sighting, fall back to where they emerge (the elevator).
 class Attack extends Mission {
   get key() { return 'attack'; }
-  objective(cmd) { return cmd.enemyFobPos(); }
+  objective(cmd) { return cmd.lastEnemyPos() || cmd.enemyFobPos(); }
   arriveDist(cmd) { return 12; }
-  label(cmd) { return 'hunting their vehicles'; }
+  label(cmd) { return cmd.lastEnemyPos() ? 'hunting their last position' : 'hunting their vehicles'; }
 }
 
 // SIEGE — level the enemy base, turret-first, until the flag is exposed.
@@ -77,16 +78,28 @@ class Capture extends Mission {
   label(cmd) { const f = cmd.flag(); return (f && f.carrier === cmd.unit) ? 'home with the flag' : 'snatching the flag'; }
 }
 
-// DEFEND — hold the home base under tower cover; the brain still engages on sight.
+// DEFEND — hold the home base under tower cover; the brain still engages on sight. Once
+// the towers are gone there's no cover to hold, so switch to a Valkyrie's mobility.
 class Defend extends Mission {
   get key() { return 'defend'; }
+  wantVehicle(cmd) { return cmd.ownTowersDown() ? 'valkyrie' : this.doc.role('defend'); }
   objective(cmd) { return cmd.patrolSpot(); }
   shoot(cmd) { return false; }
   arriveDist(cmd) { return 8; }
   label(cmd) { return 'holding the flank (ambush)'; }
 }
 
-const MISSIONS = { scout: Scout, attack: Attack, siege: Siege, capture: Capture, defend: Defend };
+// INTERCEPT — our flag's been lifted: only a Valkyrie is mobile enough to run the thief
+// down before it reaches their elevator. Drop everything and chase (ai_behavior Defend).
+class Intercept extends Mission {
+  get key() { return 'intercept'; }
+  wantVehicle(cmd) { return 'valkyrie'; }
+  objective(cmd) { return cmd.interceptSpot(); }
+  arriveDist(cmd) { return 4; }
+  label(cmd) { return 'intercepting the flag runner!'; }
+}
+
+const MISSIONS = { scout: Scout, attack: Attack, siege: Siege, capture: Capture, defend: Defend, intercept: Intercept };
 function makeMission(key) { return new (MISSIONS[key] || Attack)(); }
 
 // ---- DOCTRINE — a persona running one mission at a time ------------------------------
@@ -94,7 +107,7 @@ function makeMission(key) { return new (MISSIONS[key] || Attack)(); }
 // has run a short dwell (anti-thrash) — except URGENT transitions (grab the flag now),
 // which fire immediately. This is what makes missions complete/abort cleanly instead of
 // the old linear step machine that could never let go of a finished objective.
-const URGENT = new Set(['capture']);
+const URGENT = new Set(['capture', 'intercept']);
 const DWELL = 1.5;   // seconds a mission must run before a non-urgent switch
 
 class Doctrine {
@@ -108,8 +121,14 @@ class Doctrine {
   tick(cmd, dt) {
     this.t += dt;
     this.mission.tick(cmd, dt);
-    const next = this.choose(cmd);
+    const next = this._urgent(cmd) || this.choose(cmd);
     if (next && next !== this.step && (this.t > DWELL || URGENT.has(next))) this._switch(next, cmd);
+  }
+  // Emergencies that preempt any persona's plan: our flag's been lifted → run it down
+  // (unless WE'RE the one carrying the enemy flag home — don't blow a winning run).
+  _urgent(cmd) {
+    if (cmd.ourFlagStolen() && !(cmd.flag() && cmd.flag().carrier === cmd.unit)) return 'intercept';
+    return null;
   }
   _switch(key, cmd) {
     if (!key || key === this.step) { this.t = 0; return; }
