@@ -19,7 +19,7 @@
 // `Brain.think()` is now a thin wrapper around runBrain(DEFAULT_BRAIN, …); assign a
 // different graph to a brain's `.graph` to change its behavior.
 
-import { COUNTER } from './AIStrategies.js?v=57';   // rock-paper-scissors web for fight-or-flight matchups
+import { COUNTER } from './AIStrategies.js?v=60';   // rock-paper-scissors web for fight-or-flight matchups
 
 const TYPES = ['lurcher', 'firebrat', 'valkyrie', 'jotun'];
 const CALLSIGNS = ['Viper', 'Rook', 'Ghost', 'Talon', 'Hammer', 'Wraith', 'Jackal',
@@ -107,8 +107,10 @@ const CONDITIONS = {
   engaging: (v, m, p) => v.seesEnemy && fightScore(v, p) > 0,
   // A wall-turret is shelling us and we still have teeth → silence it first.
   threatened: (v, m, p, cfg) => !!v.threat && ammoFrac(v) > 0 && v.self.hpFrac > bailOf(p, cfg),
-  // Chase a recent sighting, but only brave brains bother.
+  // Chase a recent sighting, but only brave brains bother — and never chase a ghost once
+  // the enemy fleet is gone (the commander redirects to the base instead of wasting time).
   pursuing: (v, m, p) => {
+    if (v.enemyGone) return false;
     const seenRecently = m.lastSeen && (m.t - m.lastSeen.t) < (3 + p.aggression * 5);
     return seenRecently && p.aggression > 0.6;
   },
@@ -137,19 +139,27 @@ function resolveTarget(key, view, mem) {
   }
 }
 
-// Per-duel lateral movement, distilled from the ai_behavior matchup notes: should this
-// unit orbit/strafe to stay out of the enemy's kill arc, or plant and trade blows?
-// Returns a strafe intensity 0..1 (0 = no sidestep). Facing the enemy + strafing =
-// orbiting it, which naturally works the attacker toward the target's flank/rear.
-function duelStrafe(selfType, enemyType) {
-  if (selfType === 'valkyrie') return 1.0;          // missile skirmisher: always circle-strafe (vs Jotun especially)
-  if (selfType === 'lurcher') {
-    if (enemyType === 'jotun')    return 1.0;        // flank out of the Jotun's deadly 30° front arc, get behind
-    if (enemyType === 'valkyrie') return 0.85;       // jink so the rockets lead onto empty ground
-    if (enemyType === 'firebrat') return 0.5;        // sidestep its narrow laser arc
-    return 0.2;                                      // Lurcher mirror: mostly stand and trade
+// Per-duel FOOTWORK, the ai_behavior matchup table distilled into three intents:
+//   strafe — lateral orbit intensity 0..1 to stay out of the enemy's kill arc (facing the
+//            enemy + strafing = orbiting toward its flank/rear).
+//   press  — 0..1 desire to CLOSE the distance / cut off a fleeing target (we have the edge).
+//   kite   — 0..1 desire to fall back toward our own TOWER COVER when out-matched/pursued.
+// Read straight off the doc's per-pair notes (Lurcher vs Jotun = flank to the rear; Lurcher
+// vs Valkyrie = strafe but retreat to towers; Valkyrie vs Jotun = circle-strafe; etc.).
+function duelTactic(selfType, enemyType) {
+  if (selfType === 'valkyrie') {
+    if (enemyType === 'jotun')    return { strafe: 1.0, press: 0.2, kite: 0 };    // circle-strafe; the Jotun can't track it
+    if (enemyType === 'firebrat') return { strafe: 0.3, press: 0.7, kite: 0 };    // run it down, lead if it flees
+    if (enemyType === 'valkyrie') return { strafe: 1.0, press: 0.2, kite: 0.5 };  // no fleeing — back toward our turrets
+    return { strafe: 1.0, press: 0.1, kite: 0.4 };                                // vs Lurcher: strafe-and-go, then heal/return
   }
-  return 0;                                          // Jotun plants (it WANTS them in its arc); Firebrat runs, doesn't duel
+  if (selfType === 'lurcher') {
+    if (enemyType === 'jotun')    return { strafe: 1.0, press: 0.6, kite: 0 };     // flank out of the 30° front arc, get behind
+    if (enemyType === 'valkyrie') return { strafe: 0.85, press: 0.1, kite: 0.7 }; // jink, and fall back to tower support
+    if (enemyType === 'firebrat') return { strafe: 0.5, press: 0.8, kite: 0 };    // close in; cut it off if it runs
+    return { strafe: 0.2, press: 0.4, kite: 0.4 };                                // Lurcher mirror: trade close, near our towers
+  }
+  return { strafe: 0, press: 0, kite: 0 };           // Jotun plants (it WANTS them in its arc); Firebrat runs, doesn't duel
 }
 
 // --- BEHAVIORS ----------------------------------------------------------
@@ -237,7 +247,7 @@ const BEHAVIORS = {
       steer = view.threatLOS ? err + view.flankSide * 0.85 * k
                              : err + view.flankSide * 1.5;
     }
-    const turn = clamp(steer * 2.0, -1, 1);
+    let turn = clamp(steer * 2.0, -1, 1);
     let fwd;
     if (!los) fwd = 0.6;                          // no clean shot → circle in to find one
     else if (dist < range * 0.6) fwd = -0.5;      // inside the danger band → back out
@@ -246,18 +256,39 @@ const BEHAVIORS = {
     let fire = false;
     const gate = mode === 'suppress' ? aimGate + 0.05 : aimGate;
     if (los && Math.abs(err) < gate && dist < range * 1.3) fire = mem.rng() < (0.65 + p.aggression * 0.35) * AI_HANDICAP.fireProb;
-    // DUEL FOOTWORK (ai_behavior micro-tactics): in a real duel, orbit/strafe to flank
-    // out of the enemy's kill arc instead of standing still. Direction flips on a
-    // jittered timer (≈ the "switch directions to dodge the rocket" reflex). Engage
-    // only — siege/suppress keeps its planted standoff above.
+    // DUEL FOOTWORK (the ai_behavior matchup table) — engage only; suppress keeps its
+    // planted siege standoff above. Picks kite / press / strafe from the pairing.
     let strafe = 0;
-    if (mode === 'engage' && view.enemy && los && dist < range * 1.6) {
-      const intensity = duelStrafe(self.type, view.enemy.type);
-      if (intensity > 0) {
+    if (mode === 'engage' && view.enemy && los) {
+      const tac = duelTactic(self.type, view.enemy.type);
+      const arc = Math.min(view.shotArc || 0.26, Math.PI);   // how far off-hull the turret can still bear
+      const pressured = self.hpFrac < 0.55 || dist < range * 0.6;
+      // KITE — out-matched or pressed: fall back toward our own TOWER COVER while the turret
+      // keeps bearing on the enemy. Steer the HULL at support; fire whenever the gun bears.
+      if (tac.kite > 0.3 && view.support && pressured) {
+        const sx = view.support.x - self.x, sz = view.support.z - self.z;
+        turn = clamp(wrapPi(Math.atan2(-sx, -sz) - self.heading) * 2.0, -1, 1);
+        fwd = 1;
+        fire = (Math.abs(err) < arc && dist < range * 1.4) ? mem.rng() < 0.6 * AI_HANDICAP.fireProb : false;
+        mem._wantMove = true;
+        return { fwd, turn, fire, strafe: 0, state: mode };
+      }
+      // PRESS — we hold the edge (or they're running): close in, and CUT OFF a fleeing
+      // target by steering at a point AHEAD of its travel instead of its current spot.
+      if (tac.press > 0 && (view.enemy.retreating || tac.press >= 0.7)) {
+        if (dist > range * 0.5) fwd = 1;
+        if (view.enemy.retreating) {
+          const tx = view.enemy.x + (view.enemy.vx || 0) * 0.9, tz = view.enemy.z + (view.enemy.vz || 0) * 0.9;
+          turn = clamp(wrapPi(Math.atan2(-(tx - self.x), -(tz - self.z)) - self.heading) * 2.0, -1, 1);
+        }
+      }
+      // STRAFE — orbit out of the kill arc; direction flips on a jittered timer (≈ the
+      // "switch directions to dodge the rocket" reflex).
+      if (tac.strafe > 0 && dist < range * 1.6) {
         if (mem._strafeT == null || (mem.t - mem._strafeT) > (2.2 + mem.rng() * 2.2)) {
           mem._strafeDir = mem.rng() < 0.5 ? -1 : 1; mem._strafeT = mem.t;
         }
-        strafe = mem._strafeDir * intensity;
+        strafe = mem._strafeDir * tac.strafe;
       }
     }
     mem._wantMove = Math.abs(fwd) > 0.3 || Math.abs(strafe) > 0.3;
@@ -294,19 +325,24 @@ const BEHAVIORS = {
     return { fwd, turn, fire: false, state: ctx.mode };
   },
 
-  // RUNNER EVASION (ai_behavior Capture): a Firebrat doesn't trade shots — it runs. Steer
-  // toward the goal (the flag, or home with it) but BEND away from the nearby enemy, harder
-  // the closer it is, so the dash curves around the threat instead of straight into it.
+  // RUNNER EVASION (ai_behavior Capture): a Firebrat doesn't trade shots — it flees to the
+  // OPPOSITE direction and carries on out over the water. The away-from-threat vector leads;
+  // the goal is folded in ONLY when it points somewhere safe (not back across the pursuer).
+  // The old version always blended the goal and let its weight grow as the unit pulled
+  // away, so it kept curving back toward a goal that sat past the enemy — orbiting it to
+  // death. Gating the goal pull on "does it lead me back toward the threat?" breaks that.
   flee(ctx) {
     const { view, mem, self } = ctx;
     const e = view.enemy;
+    let ax = self.x - e.x, az = self.z - e.z;                       // away from the threat (leads)
+    const al = Math.hypot(ax, az) || 1; ax /= al; az /= al;
     let gx = view.goal.x - self.x, gz = view.goal.z - self.z;       // toward the objective
     const gl = Math.hypot(gx, gz) || 1; gx /= gl; gz /= gl;
-    let ax = self.x - e.x, az = self.z - e.z;                       // away from the threat
-    const al = Math.hypot(ax, az) || 1; ax /= al; az /= al;
-    const close = clamp(1 - al / 60, 0, 1);                         // 1 right on top of us → 0 by 60u
-    const w = 0.5 + close * 1.7;                                    // bend harder the closer the enemy
-    const fx = gx + ax * w, fz = gz + az * w;
+    // Fold the goal in only when heading for it doesn't mean heading back toward the enemy
+    // (goal-dir and away-dir roughly agree). Otherwise run PURE away — straight off the
+    // threat (and naturally toward open water) instead of circling back to die.
+    const gw = (gx * ax + gz * az) > 0 ? 0.7 : 0;
+    const fx = ax + gx * gw, fz = az + gz * gw;
     const desired = Math.atan2(-fx, -fz);                          // model front is local -Z
     const turn = clamp(wrapPi(desired - self.heading) * 2.4, -1, 1);
     mem._wantMove = true;

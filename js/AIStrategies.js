@@ -1,38 +1,38 @@
-// AIStrategies.js — the commander's "deck of moves". Each strategy is a small
-// state machine that tells the commander, every tick: which vehicle to field,
-// where to go, and whether to shoot what's ahead. A commander DRAWS a strategy
-// (weighted by its personality), plays it, and re-draws on big events — so the
-// opponent keeps surprising you (frontal blitz one match, a flanking breach the
-// next, an air-snatch with a wall-ignoring Valkyrie the next).
+// AIStrategies.js — the commander's brain at the MISSION level (the ai_behavior doc).
 //
-// Strategies stay engine-agnostic: they only call back into `cmd` for intel
-// (enemy base, the weakest wall, the flag, what vehicles have been spotted), the
-// same fog-of-war the units use. New cards (mine-laying, sensor pylons, hitting
-// fuel/ammo resupplies) slot in here — see DECK at the bottom + the TODO notes.
+// Two layers, cleanly split:
+//   MISSIONS  — reusable "high-level commands" (Scout, Attack, Siege, Capture, Defend).
+//               Each only says HOW to execute: which vehicle, where to go, whether to
+//               shoot, how close to get, and a log phrase. Missions hold no opinion about
+//               WHEN to switch — that keeps them shareable across every personality.
+//   PERSONAS  — the four commander identities (Warrior, Rogue, Hunter, Turtle). Each owns
+//               an opening mission, a vehicle-role table, and a choose() that — re-checked
+//               every tick — decides which mission to be running RIGHT NOW. A mission that
+//               has nothing left to do (e.g. Hunter with no enemy to hunt) is simply not
+//               chosen again, so a commander can never get stuck shelling an empty field.
+//
+// The commander (main.js) consumes the same interface it always did: a `strategy` object
+// with .step (current mission key), .t, tick(), wantVehicle(), objective(), shoot(),
+// arriveDist(), objectiveLabel(). onRunnerLost() replaces the old softenStep poke.
 
 // Rough rock-paper-scissors for counter-picking what's been seen (tunable):
 // firebrat ← lurcher (firepower) ← valkyrie (mobility) ← jotun (range) ← firebrat.
 export const COUNTER = { firebrat: 'lurcher', lurcher: 'valkyrie', valkyrie: 'jotun', jotun: 'firebrat' };
-const HEAVY = ['jotun', 'lurcher'];
-const FAST = ['firebrat', 'valkyrie'];
-function pick(arr, rng) { return arr[(rng() * arr.length) | 0]; }
 
-// Base class: a two-beat "attack then grab" most cards specialise.
-// IMPORTANT: wantVehicle() is polled every tick (the commander recalls its unit
-// when the answer changes), so it MUST be stable — never re-randomise per call,
-// or the unit churns in/out of base forever. Cards lock their pick in `_heavy`/
-// `_fast` (chosen once) and only change it on a deliberate step transition.
-class Strategy {
-  constructor(rng) {
-    this.rng = rng; this.step = 'open'; this.t = 0;
-    this._heavy = pick(HEAVY, rng);   // this card's committed heavy
-    this._fast = pick(FAST, rng);     // ...and fast pick, both fixed for the card
-  }
+const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
+
+// ---- MISSIONS — reusable high-level commands ---------------------------------------
+// A mission reads the running doctrine (this.doc) for its persona's vehicle-role table,
+// so the SAME Siege means "Jotun" for a Warrior and "Valkyrie" for a Rogue.
+class Mission {
+  constructor() { this.t = 0; }
+  enter(cmd, doc) { this.doc = doc; this.t = 0; }
   tick(cmd, dt) { this.t += dt; }
-  wantVehicle(cmd) { return this._heavy; }
+  wantVehicle(cmd) { return this.doc.role(this.key); }
   objective(cmd) { return cmd.enemyBasePos(); }
-  shoot(cmd) { return false; }
-  arriveDist(cmd) { return 10; }
+  shoot(cmd) { return true; }
+  arriveDist(cmd) { return 12; }
+  label(cmd) { return 'the objective'; }
   // Once carrying the flag, everyone just runs it home.
   _flagOrHome(cmd) {
     const f = cmd.flag();
@@ -40,220 +40,152 @@ class Strategy {
     if (f) return { x: f.group.position.x, z: f.group.position.z };
     return cmd.enemyBasePos();
   }
-  // A short, human phrase for whatever objective() currently points at — purely for
-  // the AI log so "advance" reads as "advancing → the front gate" instead of a bare
-  // verb. The open-step phrase is per-card (`_openLabel`); the grab/carry phrasing is
-  // shared. Keep these in sync with objective().
-  // Which step to fall BACK to when a runner dies storming a base that isn't soft yet
-  // (send a heavy to finish the turrets). Legacy cards re-open; archetypes override.
-  softenStep() { return 'open'; }
-  _openLabel(cmd) { return 'the enemy base'; }
-  objectiveLabel(cmd) {
-    const f = cmd.flag();
-    if (f && f.carrier === cmd.unit) return 'home with the flag';
-    if (this.step === 'grab') return 'the enemy flag';
-    return this._openLabel(cmd);
-  }
 }
 
-// BLITZ — roll a heavy straight at the front gate, level everything, then send a
-// runner once the fortifications buckle. Favoured by aggressive personalities.
-class Blitz extends Strategy {
-  static weight(p) { return 0.2 + p.aggression * 1.2; }
-  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && cmd.flagExposed() && (cmd.fortDown() || this.t > 75)) this.step = 'grab'; }
-  wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : this._heavy; }
-  objective(cmd) { return this.step === 'grab' ? this._flagOrHome(cmd) : cmd.enemyBasePos(); }
-  shoot(cmd) { return this.step !== 'grab'; }
-  _openLabel() { return 'the front gate'; }
-}
-
-// FLANK & BREACH — skirt to the enemy's WEAKEST wall, punch a hole there with a
-// heavy, then slip a Firebrat through the gap to the flag. Patient, sneaky.
-class FlankBreach extends Strategy {
-  static weight(p) { return 0.5 + (1 - p.aggression) * 0.8 + p.jitter; }
-  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && cmd.flagExposed() && (cmd.fortDown() || this.t > 85)) this.step = 'grab'; }
-  wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : this._heavy; }
-  objective(cmd) { return this.step === 'grab' ? this._flagOrHome(cmd) : cmd.weakestApproach(); }
-  shoot(cmd) { return this.step !== 'grab'; }
-  _openLabel() { return 'the weakest wall'; }
-}
-
-// AIR SNATCH — a Valkyrie ignores walls entirely: fly straight in and shell the
-// HQ open from point-blank (only a Firebrat can lift the flag, so the air unit
-// can't grab — it's the breacher). Once the flag is exposed, a Firebrat dashes in
-// and runs it home. High-risk wildcard; loves a daring commander.
-class AirSnatch extends Strategy {
-  static weight(p) { return 0.3 + p.wanderlust * 0.9; }
-  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && cmd.flagExposed()) this.step = 'grab'; }
-  wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : 'valkyrie'; }
-  objective(cmd) { return this.step === 'grab' ? this._flagOrHome(cmd) : cmd.enemyBasePos(); }
-  shoot(cmd) { return this.step !== 'grab'; }   // valkyrie cracks the HQ; runner holds fire
-  arriveDist(cmd) { return this.step === 'grab' ? 3 : 8; }
-  _openLabel() { return 'the HQ (flying in)'; }
-}
-
-// HUNTER — field the COUNTER to whatever the enemy keeps fielding, roam to find
-// and destroy their vehicles, then grab the flag once they're thinned out.
-class Hunter extends Strategy {
-  static weight(p) { return 0.3 + p.aggression * 0.7; }
-  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && cmd.flagExposed() && (cmd.fortDown() || this.t > 70)) this.step = 'grab'; }
-  wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : cmd.counterVehicle(); }
-  objective(cmd) { return this.step === 'grab' ? this._flagOrHome(cmd) : cmd.enemyBasePos(); }
-  shoot(cmd) { return this.step !== 'grab'; }
-  _openLabel() { return 'enemy vehicles (hunting)'; }
-}
-
-// SCOUT & SNATCH — a Valkyrie flies recon to reveal the field + supply points (it
-// sees over walls and crosses water, the best scout), then a Firebrat dashes for the
-// flag once the towers are down. Favoured by cautious types.
-class ScoutSnatch extends Strategy {
-  static weight(p) { return 0.3 + p.defensiveness * 0.8; }
-  tick(cmd, dt) { super.tick(cmd, dt); if (this.step === 'open' && cmd.flagExposed() && (cmd.fortDown() || this.t > 55)) this.step = 'grab'; }
-  wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : 'valkyrie'; }
-  // Open step: sweep unexplored map (recon) until it's mostly known, THEN press the base.
-  objective(cmd) { return this.step === 'grab' ? this._flagOrHome(cmd) : (cmd.exploreTarget() || cmd.enemyBasePos()); }
+// SCOUT — sweep unexplored map to find the enemy + supply points; don't pick fights.
+class Scout extends Mission {
+  get key() { return 'scout'; }
+  objective(cmd) { return cmd.exploreTarget() || cmd.enemyFobPos(); }
   shoot(cmd) { return false; }
-  arriveDist(cmd) { return this.step === 'grab' ? 3 : 30; }
-  _openLabel(cmd) { return cmd && cmd._exploreWp ? 'sweeping for recon' : 'the enemy base'; }
+  arriveDist(cmd) { return 30; }
+  label(cmd) { return 'sweeping for recon'; }
 }
 
-// TODO (need new game systems first, then add cards here):
-//  - MineLayer / PylonNet: drop area-denial mines + sensor pylons that extend the
-//    commander's vision (a "deployables" system on vehicles).
-//  - SupplyRaid: hit the enemy's fuel/ammo resupply points first to starve them
-//    (needs resupply nodes on the map + the commander knowing/seeing them).
+// ATTACK — hunt the enemy's vehicles where they emerge, kill what comes out.
+class Attack extends Mission {
+  get key() { return 'attack'; }
+  objective(cmd) { return cmd.enemyFobPos(); }
+  arriveDist(cmd) { return 12; }
+  label(cmd) { return 'hunting their vehicles'; }
+}
 
-const DECK = [Blitz, FlankBreach, AirSnatch, Hunter, ScoutSnatch];
+// SIEGE — level the enemy base, turret-first, until the flag is exposed.
+class Siege extends Mission {
+  get key() { return 'siege'; }
+  objective(cmd) { return cmd.enemyBasePos(); }
+  arriveDist(cmd) { return cmd.unit && cmd.unit.type === 'valkyrie' ? 26 : 12; }   // flyers shell from standoff
+  label(cmd) { return 'the enemy base'; }
+}
 
-// --- ARCHETYPES — named commander doctrines (the redesign in ai_behavior.txt) -------
-// Unlike a deck CARD (one mood, drawn at random), an ARCHETYPE is the commander's whole
-// identity: a fixed multi-phase plan it always runs. First one in: the WARRIOR.
-//
-// WARRIOR doctrine — "ride out, rack up kills, then break the base":
-//   hunt   — take a Lurcher out toward the enemy's elevator to kill what emerges; if we
-//            don't know where they are yet, sweep the map (explore) to find them.
-//   siege  — after a couple of kills (or a patience timer), bring up a Jotun and level
-//            the enemy base, turret-first.
-//   grab   — once the fort's breached, send a Firebrat to lift the flag and run it home.
-// Steps reuse the 'grab' name so the existing runner-died re-softening logic still fires.
-class Warrior extends Strategy {
-  constructor(rng) { super(rng); this.step = 'hunt'; }
+// CAPTURE — run a Firebrat for the flag; do NOT engage (the runner flees contact).
+class Capture extends Mission {
+  get key() { return 'capture'; }
+  wantVehicle(cmd) { return 'firebrat'; }
+  objective(cmd) { return this._flagOrHome(cmd); }
+  shoot(cmd) { return false; }
+  arriveDist(cmd) { return 3; }
+  label(cmd) { const f = cmd.flag(); return (f && f.carrier === cmd.unit) ? 'home with the flag' : 'snatching the flag'; }
+}
+
+// DEFEND — hold the home base under tower cover; the brain still engages on sight.
+class Defend extends Mission {
+  get key() { return 'defend'; }
+  objective(cmd) { return cmd.patrolSpot(); }
+  shoot(cmd) { return false; }
+  arriveDist(cmd) { return 8; }
+  label(cmd) { return 'holding the flank (ambush)'; }
+}
+
+const MISSIONS = { scout: Scout, attack: Attack, siege: Siege, capture: Capture, defend: Defend };
+function makeMission(key) { return new (MISSIONS[key] || Attack)(); }
+
+// ---- DOCTRINE — a persona running one mission at a time ------------------------------
+// Re-evaluates choose() every tick. A change only takes effect once the current mission
+// has run a short dwell (anti-thrash) — except URGENT transitions (grab the flag now),
+// which fire immediately. This is what makes missions complete/abort cleanly instead of
+// the old linear step machine that could never let go of a finished objective.
+const URGENT = new Set(['capture']);
+const DWELL = 1.5;   // seconds a mission must run before a non-urgent switch
+
+class Doctrine {
+  constructor(rng = Math.random, log = null) {
+    this.rng = rng; this.log = log; this.t = 0;
+    this.mission = makeMission(this.opening);
+    this.mission.enter(null, this);
+    this.step = this.mission.key;
+  }
+  role(key) { return this.roles[key] || this.roles.attack || 'lurcher'; }
   tick(cmd, dt) {
-    super.tick(cmd, dt);
-    if (this.step === 'hunt') {
-      if (cmd.kills >= 2 || this.t > 70) { this.step = 'siege'; this.t = 0; }   // bloodied enough → press the base
-    } else if (this.step === 'siege') {
-      if (cmd.flagExposed() && (cmd.fortDown() || this.t > 85)) { this.step = 'grab'; this.t = 0; }
-    }
+    this.t += dt;
+    this.mission.tick(cmd, dt);
+    const next = this.choose(cmd);
+    if (next && next !== this.step && (this.t > DWELL || URGENT.has(next))) this._switch(next, cmd);
   }
-  softenStep() { return 'siege'; }   // runner died → bring the Jotun back to finish the turrets
-  wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : this.step === 'siege' ? 'jotun' : 'lurcher'; }
-  objective(cmd) {
-    if (this.step === 'grab') return this._flagOrHome(cmd);
-    if (this.step === 'siege') return cmd.enemyBasePos();
-    return cmd.enemyFobPos();   // hunt: ride out to the enemy's elevator and kill what emerges
+  _switch(key, cmd) {
+    if (!key || key === this.step) { this.t = 0; return; }
+    const from = this.step;
+    this.mission = makeMission(key);
+    this.mission.enter(cmd, this);
+    this.step = key; this.t = 0;
+    if (this.log) this.log(`${from} → ${key}`);
   }
-  shoot(cmd) { return this.step !== 'grab'; }
-  arriveDist(cmd) { return this.step === 'grab' ? 3 : 10; }
+  // Runner died storming the base → the approach isn't safe; go back to softening it.
+  onRunnerLost(cmd) { this._switch(this.softenKey, cmd); }
+  get softenKey() { return 'siege'; }
+  // --- interface the commander consumes (delegated to the running mission) ---
+  wantVehicle(cmd) { return this.mission.wantVehicle(cmd); }
+  objective(cmd) { return this.mission.objective(cmd); }
+  shoot(cmd) { return this.mission.shoot(cmd); }
+  arriveDist(cmd) { return this.mission.arriveDist(cmd); }
   objectiveLabel(cmd) {
     const f = cmd.flag();
     if (f && f.carrier === cmd.unit) return 'home with the flag';
-    if (this.step === 'grab') return 'the enemy flag';
-    if (this.step === 'siege') return 'the enemy base';
-    return 'the enemy elevator';
+    return this.mission.label(cmd);
+  }
+  softenStep() { return this.softenKey; }   // back-compat (no longer poked directly)
+}
+
+// WARRIOR — "ride out, rack up kills, then break the base" (uses Lurcher → Jotun → runner).
+class Warrior extends Doctrine {
+  get opening() { return 'attack'; }
+  get roles() { return { scout: 'lurcher', attack: 'lurcher', siege: 'jotun', defend: 'lurcher', capture: 'firebrat' }; }
+  choose(cmd) {
+    if (cmd.flagExposed() && cmd.fortDown()) return 'capture';
+    if (cmd.kills >= 2 || cmd.enemyEliminated()) return 'siege';
+    return 'attack';
   }
 }
 
-// TURTLE doctrine — "hold the wall, bleed them, then sortie":
-//   defend — sit a Lurcher on the home base and let the turrets do the heavy lifting;
-//            kill attackers that come to grab the flag (the brain engages on sight).
-//   siege  — once a couple of attackers are beaten back (or patience runs out — so two
-//            turtles don't stalemate forever), bring up a Valkyrie and crack their base.
-//   grab   — send a Firebrat to lift the flag once the fort's breached.
-// A Turtle defending its base is exactly where an attacking Warrior is headed, so the two
-// archetypes MEET there — the contrast makes the fight the all-aggressor deck never had.
-class Turtle extends Strategy {
-  constructor(rng) { super(rng); this.step = 'defend'; }
-  tick(cmd, dt) {
-    super.tick(cmd, dt);
-    if (this.step === 'defend') {
-      if (cmd.kills >= 2 || this.t > 120) { this.step = 'siege'; this.t = 0; }   // beaten them back (or got bored) → sortie
-    } else if (this.step === 'siege') {
-      if (cmd.flagExposed() && (cmd.fortDown() || this.t > 85)) { this.step = 'grab'; this.t = 0; }
-    }
-  }
-  softenStep() { return 'siege'; }
-  wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : this.step === 'siege' ? 'valkyrie' : 'lurcher'; }
-  objective(cmd) {
-    if (this.step === 'grab') return this._flagOrHome(cmd);
-    if (this.step === 'siege') return cmd.enemyBasePos();
-    return cmd.patrolSpot();   // defend: pace the base perimeter (tower cover), ready to flank — not parked on one spot
-  }
-  shoot(cmd) { return this.step === 'siege'; }   // hold fire while defending (the brain still engages enemies on sight)
-  arriveDist(cmd) { return this.step === 'grab' ? 3 : this.step === 'defend' ? 8 : 10; }
-  objectiveLabel(cmd) {
-    const f = cmd.flag();
-    if (f && f.carrier === cmd.unit) return 'home with the flag';
-    if (this.step === 'grab') return 'the enemy flag';
-    if (this.step === 'siege') return 'the enemy base';
-    return 'holding the flank (ambush)';
+// ROGUE — "snatch before they know you're there": a Valkyrie quietly softens the flag
+// base from range, then a Firebrat races in the instant it's open. Avoids brawls.
+class Rogue extends Doctrine {
+  get opening() { return 'siege'; }
+  get roles() { return { scout: 'firebrat', attack: 'valkyrie', siege: 'valkyrie', defend: 'valkyrie', capture: 'firebrat' }; }
+  choose(cmd) {
+    if (cmd.flagExposed()) return 'capture';   // a race — go the moment the flag shows
+    return 'siege';
   }
 }
 
-// ROGUE doctrine — "snatch the flag before they know you're there":
-//   soften — a Valkyrie takes a wide approach to the enemy FLAG base and quietly knocks
-//            the towers down. It avoids brawls (the brain still defends itself) and works
-//            fast: short patience, no attrition phase.
-//   grab   — the instant the fort's open, a Firebrat races in, lifts the flag, and runs.
-// The race archetype: speed + stealth over a stand-up fight (contrast to the Warrior).
-class Rogue extends Strategy {
-  constructor(rng) { super(rng); this.step = 'soften'; }
-  tick(cmd, dt) {
-    super.tick(cmd, dt);
-    if (this.step === 'soften' && cmd.flagExposed() && (cmd.fortDown() || this.t > 55)) { this.step = 'grab'; this.t = 0; }
-  }
-  softenStep() { return 'soften'; }   // runner died → bring the Valkyrie back to finish the towers
-  wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : 'valkyrie'; }
-  objective(cmd) { return this.step === 'grab' ? this._flagOrHome(cmd) : cmd.enemyBasePos(); }
-  shoot(cmd) { return this.step !== 'grab'; }
-  arriveDist(cmd) { return this.step === 'grab' ? 3 : 28; }   // Valkyrie shells towers from range; runner goes in tight
-  objectiveLabel(cmd) {
-    const f = cmd.flag();
-    if (f && f.carrier === cmd.unit) return 'home with the flag';
-    if (this.step === 'grab') return 'snatching the flag';
-    return 'the flag-base towers';
+// HUNTER — "own the field, ambush the weak, then snatch". Scouts with a Valkyrie to find
+// the enemy (RESERVING its Firebrats for the capture), hunts with a Lurcher, and — the
+// key fix — when there's nothing left to hunt, cracks the base instead of firing at air.
+class Hunter extends Doctrine {
+  get opening() { return 'scout'; }
+  get roles() { return { scout: 'valkyrie', attack: 'lurcher', siege: 'valkyrie', defend: 'lurcher', capture: 'firebrat' }; }
+  choose(cmd) {
+    if (cmd.flagExposed() && cmd.fortDown()) return 'capture';
+    if (cmd.enemyEliminated()) return 'siege';                 // no one to hunt → press the base
+    if (cmd.kills >= 3 && cmd.flagExposed()) return 'capture';
+    if (!cmd.knowsEnemy()) return 'scout';                     // haven't found them yet → recon
+    return 'attack';
   }
 }
 
-// HUNTER doctrine — "own the field, ambush the weak, then snatch":
-//   hunt — field the COUNTER to whatever the enemy keeps deploying and roam toward their
-//          elevator to pick off vehicles (the brain's engage + finish-him do the dueling).
-//   grab — once they're thinned out (a few kills) and the fort's open, a Firebrat runs the flag.
-// Unlike the WARRIOR it never commits a Jotun to a formal siege — it wins by killing
-// vehicles until the base falls open under the pressure.
-class HunterDoctrine extends Strategy {
-  constructor(rng) { super(rng); this.step = 'hunt'; }
-  tick(cmd, dt) {
-    super.tick(cmd, dt);
-    if (this.step === 'hunt' && cmd.flagExposed() && (cmd.fortDown() || (cmd.kills >= 3 && this.t > 60) || this.t > 110)) { this.step = 'grab'; this.t = 0; }
-  }
-  softenStep() { return 'hunt'; }
-  wantVehicle(cmd) { return this.step === 'grab' ? 'firebrat' : cmd.counterVehicle(); }
-  objective(cmd) { return this.step === 'grab' ? this._flagOrHome(cmd) : cmd.enemyFobPos(); }
-  shoot(cmd) { return this.step !== 'grab'; }
-  arriveDist(cmd) { return this.step === 'grab' ? 3 : 12; }
-  objectiveLabel(cmd) {
-    const f = cmd.flag();
-    if (f && f.carrier === cmd.unit) return 'home with the flag';
-    if (this.step === 'grab') return 'snatching the flag';
-    return 'hunting their vehicles';
+// TURTLE — "hold the wall, bleed them, then sortie". Defends under tower cover and only
+// goes on the offensive once it's beaten attackers back.
+class Turtle extends Doctrine {
+  get opening() { return 'defend'; }
+  get roles() { return { scout: 'lurcher', attack: 'lurcher', siege: 'valkyrie', defend: 'lurcher', capture: 'firebrat' }; }
+  choose(cmd) {
+    if (cmd.flagExposed() && cmd.fortDown()) return 'capture';
+    if (cmd.kills >= 2 || cmd.enemyEliminated()) return 'siege';
+    return 'defend';
   }
 }
 
-// The roster of named doctrines (the four from ai_behavior).
-const ARCHETYPE_CLASS = { warrior: Warrior, turtle: Turtle, rogue: Rogue, hunter: HunterDoctrine };
-const ARCHETYPES = Object.keys(ARCHETYPE_CLASS);
-function archetypeClass(name) { return ARCHETYPE_CLASS[name] || Warrior; }
+const DOCTRINE_CLASS = { warrior: Warrior, turtle: Turtle, rogue: Rogue, hunter: Hunter };
+const ARCHETYPES = Object.keys(DOCTRINE_CLASS);
 
 // One commander's archetype (random). Used for the lone AI in a human match.
 export function pickArchetype(rng = Math.random) { return ARCHETYPES[(rng() * ARCHETYPES.length) | 0]; }
@@ -266,22 +198,9 @@ export function assignArchetypes(n, rng = Math.random) {
   return Array.from({ length: n }, (_, i) => pool[i % pool.length]);
 }
 
-// Build the strategy a commander runs: its archetype's fixed doctrine, or — with no
-// archetype — a random card off the legacy deck.
-export function makeDoctrine(archetype, personality, rng = Math.random, avoid = null) {
-  if (archetype) return new (archetypeClass(archetype))(rng);
-  return drawStrategy(personality, rng, avoid);
-}
-
-// Weighted random draw, biased by personality, with a dash of pure noise so the
-// pick is never fully predictable. `avoid` lets a re-draw prefer something new.
-export function drawStrategy(personality, rng = Math.random, avoid = null) {
-  const weights = DECK.map(S => {
-    let w = Math.max(0.01, S.weight(personality)) * (0.6 + rng() * 0.8);
-    if (avoid && S === avoid) w *= 0.25;
-    return w;
-  });
-  let total = weights.reduce((a, b) => a + b, 0), r = rng() * total;
-  for (let i = 0; i < DECK.length; i++) { if ((r -= weights[i]) <= 0) return new DECK[i](rng); }
-  return new DECK[0](rng);
+// Build the doctrine a commander runs from its archetype name. `log` (optional) is a
+// per-commander logger so mission switches surface in the AI overlay.
+export function makeDoctrine(archetype, personality, rng = Math.random, avoid = null, log = null) {
+  const C = DOCTRINE_CLASS[archetype] || Warrior;
+  return new C(rng, log);
 }

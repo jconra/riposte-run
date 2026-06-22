@@ -16,8 +16,8 @@ import { Garage, GARAGE_COUNTS } from './Garage.js?v=1';
 import { TEAM_COLORS, updateCamo, camoParams } from '../../vehicle-designer/js/CamoTexture.js';
 import { SoundManager } from '../../vehicle-designer/js/SoundManager.js';
 import { Projectiles } from '../../vehicle-designer/js/Projectiles.js';
-import { Brain, randomPersonality } from './AI.js?v=68';
-import { drawStrategy, makeDoctrine, pickArchetype, assignArchetypes, COUNTER } from './AIStrategies.js?v=59';
+import { Brain, randomPersonality } from './AI.js?v=71';
+import { makeDoctrine, pickArchetype, assignArchetypes, COUNTER } from './AIStrategies.js?v=60';
 import { ExploreMemory } from './ExploreMemory.js?v=54';
 import { astarGrid } from './astar.js';
 import { makeFuelTank, makeAmmoDepot, makeShieldGenerator, makeShieldBubble, RESUPPLY_TINT } from './Resupply.js';
@@ -1347,8 +1347,8 @@ function spawnWake(x, y, z, r0) {
   m.rotation.x = -Math.PI / 2;
   m.position.set(x, y, z);
   scene.add(m);
-  fx.push({ obj: m, life: 0.8, max: 0.8,
-    update(dt, k) { m.scale.setScalar(r0 * (0.6 + (1 - k) * 1.8)); mat.opacity = 0.5 * k; },
+  fx.push({ obj: m, life: 1.0, max: 1.0,
+    update(dt, k) { m.scale.setScalar(r0 * (0.8 + (1 - k) * 2.6)); mat.opacity = 0.55 * k; },
     dispose() { m.geometry.dispose(); mat.dispose(); } });
 }
 
@@ -1502,7 +1502,7 @@ function applyAltitude(veh, dt) {
       if (veh._wakeT <= 0) {
         veh._wakeT = 0.06;   // ~16 puffs/sec while moving
         const inv = veh.hitR / sp, bx = x - veh._vx * inv, bz = z - veh._vz * inv;   // one hull-radius behind
-        if (!map.isLand(bx, bz)) spawnWake(bx, map.floorAt(bx, bz) + 0.1, bz, veh.hitR * 0.45);
+        if (!map.isLand(bx, bz)) spawnWake(bx, map.floorAt(bx, bz) + 0.1, bz, veh.hitR * 0.95);
       }
     }
   }
@@ -1998,7 +1998,7 @@ class AICommander {
     this.respawnT = 0;
     this.deaths = 0;
     this.kills = 0;                                   // enemy vehicles this commander's units have downed
-    this.strategy = makeDoctrine(this.archetype, this.personality);   // the archetype's plan (or a deck card)
+    this.strategy = makeDoctrine(this.archetype, this.personality, Math.random, null, m => aiLog(this.team, `${this.cname} ${m}`));   // the archetype's mission doctrine
     this.fortHp0 = null;                              // enemy fort HP when this card started
     this.seenTypes = {};                              // rival vehicle types this team has spotted
     this.knownSupplies = new Set();                   // fog-of-war: resupply POIs this team has SCOUTED
@@ -2042,6 +2042,17 @@ class AICommander {
   enemyBasePos() { return teamCenter(this.targetTeam(), 'main'); }
   enemyFobPos() { return teamCenter(this.targetTeam(), 'fob'); }   // where the enemy's units rise — the Warrior hunts here
   homeBasePos() { return teamCenter(this.team, 'main'); }           // our own flag base
+  // Have we ever laid eyes on an enemy vehicle? (drives Hunter scout → attack)
+  knowsEnemy() { return Object.keys(this.seenTypes).length > 0; }
+  // Is the target team out of the fight for good — no live unit AND its commander is
+  // eliminated? (A human team has no commander and can always redeploy, so never "out".)
+  // Lets a mission like the Hunter's hunt END instead of firing at an empty elevator.
+  enemyEliminated() {
+    const tt = this.targetTeam();
+    for (const o of combatants) if (!o.dead && o.team === tt) return false;
+    const ec = commanders.find(c => c.team === tt);
+    return !!(ec && ec._eliminated);
+  }
   // A holding spot to the SIDE of our flag base — on the enemy-facing edge but offset
   // off the approach lane, inside tower cover. The Turtle ambushes from here and flanks
   // an attacker, instead of huddling on the flag HQ (which is what looked too passive).
@@ -2177,7 +2188,7 @@ class AICommander {
   get cname() { return teamLabel(this.colorIndex); }
 
   // Draw a fresh card (on repeated losses / stalls) — keeps the AI unpredictable.
-  redraw() { this.strategy = makeDoctrine(this.archetype, this.personality, Math.random, this.strategy.constructor); this.fortHp0 = fortHpOf(this.targetTeam()) || this.fortHp0; this.targetTurrets0 = turretCountOf(this.targetTeam()); this.failStreak = 0; aiLog(this.team, `${this.cname} ${this.archetype ? 'regroups' : 'draws ' + (this.strategy.constructor.name || 'card').replace('Strategy', '')} (new plan)`); }
+  redraw() { this.strategy = makeDoctrine(this.archetype, this.personality, Math.random, this.strategy.constructor, m => aiLog(this.team, `${this.cname} ${m}`)); this.fortHp0 = fortHpOf(this.targetTeam()) || this.fortHp0; this.targetTurrets0 = turretCountOf(this.targetTeam()); this.failStreak = 0; aiLog(this.team, `${this.cname} regroups (new plan)`); }
 
   deploy() {
     const want = this.strategy.wantVehicle(this);
@@ -2405,6 +2416,12 @@ class AICommander {
   }
 
   update(dt) {
+    // Notify once the moment the enemy fleet is wiped — instead of a unit silently
+    // wandering off to "chase the last seen enemy" that no longer exists.
+    if (!this._enemyGoneAnnounced && this.enemyEliminated()) {
+      this._enemyGoneAnnounced = true;
+      aiLog(this.team, `${this.cname} — enemy fleet destroyed, pressing the base`);
+    }
     if (!this.unit || this.unit.dead) {
       if (this.unit && this.unit.dead) {
         this.deaths++;
@@ -2414,8 +2431,8 @@ class AICommander {
         // A runner died storming the base → the approach isn't safe yet. Go BACK to
         // softening (send a heavy to finish the towers) instead of feeding another
         // Firebrat into the exact same death.
-        if (this.unit.type === 'firebrat' && this.strategy.step === 'grab') {
-          this.strategy.step = this.strategy.softenStep(); this.strategy.t = 0;
+        if (this.unit.type === 'firebrat' && this.strategy.step === 'capture') {
+          this.strategy.onRunnerLost(this);
           this.targetTurrets0 = turretCountOf(this.targetTeam());
           aiLog(this.team, `${this.cname} runner down — re-softening (towers still up)`);
         }
@@ -2644,6 +2661,8 @@ class AICommander {
       dt,
       self: { x: px, z: pz, heading: h, type: v.type, shield: v.shield, hpFrac: v.hp / v.maxHp, fuelFrac: v.fuel / v.maxFuel, ammoFrac: v.ammo / v.maxAmmo },
       seesEnemy, enemy, flyer, shotArc: SHOT_ARC[v.type] ?? Math.PI / 5,
+      enemyGone: this.enemyEliminated(),   // target fleet wiped → don't waste time ghost-chasing a dead sighting
+      support: turretCountOf(this.team) > 0 ? this.homeBasePos() : null,   // rally toward own tower cover (ai_behavior duels)
       threat, threatLOS, flankSide, threatStand, demolishTarget, breakTarget, engageRange: ENGAGE_RANGE[v.type] || 36,
       goal: mustGo ? this._exit : goal,
       mustGo,
