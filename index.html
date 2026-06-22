@@ -24,9 +24,9 @@
             color: #1d2b33; text-shadow: 0 1px 2px rgba(255,255,255,0.6);
             text-align: left; letter-spacing: 1px;
         }
-        /* On-screen drive stick — revealed on touch devices (see main.js) */
+        /* On-screen DRIVE stick (left) — revealed on touch devices (see main.js) */
         #touch-joystick {
-            position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%);
+            position: fixed; bottom: 34px; left: 26px; transform: none;
             width: 132px; height: 132px; border-radius: 50%;
             background: rgba(5, 12, 20, 0.45);
             border: 1px solid rgba(255, 255, 255, 0.4);
@@ -35,6 +35,37 @@
             user-select: none; -webkit-user-select: none;
         }
         #touch-joystick.visible { display: block; }
+        /* On-screen AIM stick (right) — tilt to aim within the vehicle's firing arc
+           (the lit wedge), push to the rim to FIRE. Aim-assist snaps to a nearby enemy. */
+        #touch-aim {
+            position: fixed; bottom: 34px; right: 26px;
+            width: 132px; height: 132px; border-radius: 50%;
+            background: rgba(20, 6, 6, 0.42);
+            border: 1px solid rgba(255, 160, 160, 0.55);
+            box-shadow: 0 0 12px rgba(0,0,0,0.25), inset 0 0 18px rgba(255,120,120,0.08);
+            z-index: 120; display: none; touch-action: none;
+            user-select: none; -webkit-user-select: none;
+        }
+        #touch-aim.visible { display: block; }
+        #touch-aim.firing { border-color: rgba(255, 90, 90, 0.95); box-shadow: 0 0 18px rgba(255,60,60,0.5), inset 0 0 18px rgba(255,90,90,0.18); }
+        /* Lit sector showing the firing arc (forward = up); set per-vehicle from JS. */
+        #aim-arc {
+            position: absolute; inset: 4px; border-radius: 50%;
+            background: rgba(120,210,150,0.20); pointer-events: none;
+        }
+        #aim-knob {
+            position: absolute; top: 50%; left: 50%;
+            width: 56px; height: 56px; margin: -28px 0 0 -28px; border-radius: 50%;
+            background: rgba(255, 160, 160, 0.18);
+            border: 1px solid rgba(255, 170, 170, 0.8);
+            box-shadow: 0 0 10px rgba(255,120,120,0.4);
+            transition: transform 0.04s linear; pointer-events: none;
+        }
+        #aim-hint {
+            position: absolute; bottom: 6px; left: 50%; transform: translateX(-50%);
+            font-family: 'Courier New', monospace; font-size: 10px; letter-spacing: 0.1em;
+            color: rgba(255, 200, 200, 0.6); pointer-events: none;
+        }
         .tj-label {
             position: absolute; font-size: 11px; font-weight: bold; letter-spacing: 0.1em;
             color: rgba(255, 255, 255, 0.55); pointer-events: none;
@@ -111,6 +142,11 @@
     </div>
     <div id="fire-btn-l" aria-hidden="true">FIRE</div>
     <div id="fire-btn" aria-hidden="true">FIRE</div>
+    <div id="touch-aim" aria-hidden="true">
+        <div id="aim-arc"></div>
+        <div id="aim-knob"></div>
+        <span id="aim-hint">AIM</span>
+    </div>
     <script type="importmap">
     {
         "imports": {
@@ -119,6 +155,6 @@
         }
     }
     </script>
-    <script type="module" src="js/main.js?v=172"></script>
+    <script type="module" src="js/main.js?v=189"></script>
 </body>
 </html>

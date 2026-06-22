@@ -5,9 +5,9 @@
 import * as THREE from 'three';
 import { IslandMap, DEFAULTS } from './IslandMap.js?v=68';
 import { Controls } from './Controls.js';
-import { DestructibleManager, Destructible } from './Destructible.js';
+import { DestructibleManager, Destructible } from './Destructible.js?v=1';
 import { BuildGrid } from './BuildGrid.js';
-import { Camp } from './Walls.js?v=52';
+import { Camp } from './Walls.js?v=53';
 import { RoadNetwork } from './Roads.js?v=79';
 import { Foliage } from './Foliage.js?v=2';
 import { Vehicle, VEHICLE_TYPES } from './Vehicles.js?v=66';
@@ -16,8 +16,8 @@ import { Garage, GARAGE_COUNTS } from './Garage.js?v=4';
 import { TEAM_COLORS, updateCamo, camoParams } from '../../vehicle-designer/js/CamoTexture.js';
 import { SoundManager } from '../../vehicle-designer/js/SoundManager.js?v=2';
 import { Projectiles } from '../../vehicle-designer/js/Projectiles.js';
-import { Brain, randomPersonality } from './AI.js?v=76';
-import { makeDoctrine, pickArchetype, assignArchetypes, COUNTER } from './AIStrategies.js?v=64';
+import { Brain, randomPersonality } from './AI.js?v=80';
+import { makeDoctrine, pickArchetype, assignArchetypes, COUNTER } from './AIStrategies.js?v=66';
 import { ExploreMemory } from './ExploreMemory.js?v=54';
 import { astarGrid } from './astar.js';
 import { makeFuelTank, makeAmmoDepot, makeShieldGenerator, makeShieldBubble, RESUPPLY_TINT } from './Resupply.js';
@@ -121,6 +121,14 @@ let touchSteer = null;            // { x, y } screen point the vehicle should dr
 // still fires; only a held finger strafes (see the dwell gate in driveInput).
 let touchStrafe = null;
 const TOUCH_STOP_R = 7;           // world radius around the vehicle that reads as "stop"
+// Touch AIM stick (right thumb): tilt sets the desired turret offset from the hull
+// forward (clamped to the vehicle's arc), push to the rim FIRES. { nx, ny, mag } in
+// stick space (nx right, ny down, mag 0..>1). touchAiming = a finger is on it now.
+let touchAim = null;
+let touchAiming = false;
+const RIM_FIRE = 0.92;            // knob pushed this far toward the edge = pull the trigger
+const ASSIST_CONE = 0.30;         // rad; an enemy within this of where you point gets auto-aimed
+const ASSIST_RANGE = 150;         // u; aim-assist only reaches this far
 
 function updateCamera() {
   const cp = Math.max(0.15, Math.min(1.45, orbit.pitch));
@@ -173,18 +181,10 @@ function updateCamera() {
   const isTap = s => Math.hypot(s.x - s.sx, s.y - s.sy) < 12 && performance.now() - s.t < 300;
 
   el.addEventListener('touchstart', e => {
-    if (humanDriving()) {
-      for (const t of e.changedTouches) {
-        const s = { sx: t.clientX, sy: t.clientY, x: t.clientX, y: t.clientY, t: performance.now() };
-        if (steerId === null) { steerId = t.identifier; steerStart = s; touchSteer = { x: t.clientX, y: t.clientY }; }
-        else {
-          taps[t.identifier] = s;
-          // First extra finger doubles as the strafe stick (still fires if it's a quick tap).
-          if (touchStrafe === null) touchStrafe = { id: t.identifier, x: t.clientX, y: t.clientY, t: performance.now() };
-        }
-      }
-      return;
-    }
+    // While driving, the two on-screen sticks own control (left = drive, right = aim);
+    // the open field is inert (the camera auto-follows). Touches on the sticks hit their
+    // own pointer handlers, not this canvas listener.
+    if (humanDriving()) return;
     if (e.touches.length === 1) {
       const t = e.touches[0];
       touchPan.active = true; touchPan.x = touchPan.sx = t.clientX; touchPan.y = touchPan.sy = t.clientY;
@@ -339,7 +339,7 @@ function updateSpectateTag(focus) {
   }
   spectateTagEl.style.display = 'block';
   const col = TEAM_COLORS[focus.colorIndex] ? '#' + TEAM_COLORS[focus.colorIndex].hex.toString(16).padStart(6, '0') : '#2b2118';
-  const name = focus.ai && focus.ai.p ? focus.ai.p.name : (focus.team || '');
+  const name = teamLabel(focus.colorIndex);   // identify by team COLOUR, not a callsign
   const pin = spectateTarget ? '📌' : '▶';
   spectateTagEl.innerHTML = `<span style="color:${col};font-weight:bold">${pin} ${name.toUpperCase()}</span>` +
     `<span style="color:#1d2b33"> · ${focus.type.toUpperCase()}</span>`;
@@ -505,6 +505,110 @@ const playerLosses = LOSSES ? { ...LOSSES } : {};
     btn.addEventListener('pointerleave', lift);
   }
 })();
+
+// On-screen AIM stick (touch, right thumb). Tilt to point the gun (knob angle =
+// desired turret offset from the hull forward, clamped to the type's arc); push the
+// knob to the rim to FIRE. The actual aiming + aim-assist runs per-frame in
+// updateTouchAim — this handler only records the stick vector and draws the knob.
+(function setupAimStick() {
+  const stick = document.getElementById('touch-aim');
+  const knob = document.getElementById('aim-knob');
+  if (!stick || !knob) return;
+  const MAX_TRAVEL = 46;
+  let aimId = null;
+  const apply = (cx, cy) => {
+    const r = stick.getBoundingClientRect();
+    let dx = cx - (r.left + r.width / 2), dy = cy - (r.top + r.height / 2);
+    const d = Math.hypot(dx, dy);
+    const mag = d / MAX_TRAVEL;                 // raw, can exceed 1 when pushed past the rim
+    let kx = dx, ky = dy;
+    if (d > MAX_TRAVEL) { kx *= MAX_TRAVEL / d; ky *= MAX_TRAVEL / d; }
+    knob.style.transform = `translate(${kx}px, ${ky}px)`;
+    touchAim = { nx: dx / MAX_TRAVEL, ny: dy / MAX_TRAVEL, mag };
+    stick.classList.toggle('firing', mag >= RIM_FIRE);
+  };
+  const release = () => {
+    aimId = null; touchAim = null; touchAiming = false; fireHeld = false;
+    knob.style.transform = 'translate(0px, 0px)';
+    stick.classList.remove('firing');
+  };
+  stick.addEventListener('pointerdown', e => {
+    if (aimId !== null) return;
+    aimId = e.pointerId; stick.setPointerCapture(e.pointerId);
+    apply(e.clientX, e.clientY); e.preventDefault();
+  });
+  stick.addEventListener('pointermove', e => {
+    if (e.pointerId !== aimId) return;
+    apply(e.clientX, e.clientY); e.preventDefault();
+  });
+  const end = e => { if (e.pointerId === aimId) release(); };
+  stick.addEventListener('pointerup', end);
+  stick.addEventListener('pointercancel', end);
+})();
+
+// Paint the aim stick's lit wedge to match the live vehicle's firing arc (forward =
+// up). Full ring for the Lurcher (any direction); a narrow sector for the Jotun; a
+// half for the Valkyrie. Tiny fixed-gun arcs (Firebrat) get a readable minimum.
+function refreshAimArc() {
+  const el = document.getElementById('aim-arc');
+  if (!el || !player) return;
+  const arc = SHOT_ARC[player.type] ?? Math.PI / 5;
+  const hi = 'rgba(120,210,150,0.30)';
+  if (arc >= Math.PI - 1e-3) { el.style.background = 'rgba(120,210,150,0.18)'; return; }   // 360°
+  const deg = Math.max(16, arc * 180 / Math.PI);   // min 16°/side so a fixed gun still shows
+  el.style.background = `conic-gradient(${hi} 0 ${deg}deg, transparent ${deg}deg ${360 - deg}deg, ${hi} ${360 - deg}deg 360deg)`;
+}
+
+// Per-frame: turn the aim stick's tilt into a world aim point (with aim-assist) so the
+// existing turret-tracking + fire pipeline (aimPlayerTurret / firePlayer) just works on
+// touch — no cursor needed. Sets _aimPoint/_aimTargetVeh/_aimValid and fireHeld.
+const _aimStickV = new THREE.Vector3();
+function updateTouchAim() {
+  touchAiming = false;
+  if (!onField || !player || player.dead || !touchAim) return;
+  touchAiming = true;
+  const hp = player.holder.position;
+  const arc = SHOT_ARC[player.type] ?? Math.PI / 5;
+  // Stick → desired offset from the hull forward: up = 0, pushing right swings the
+  // turret to the vehicle's right (negative rel, matching wrapPi(targetAng - heading)).
+  const stickAng = Math.atan2(-touchAim.nx, -touchAim.ny);
+  const desired = Math.max(-arc, Math.min(arc, stickAng));
+  const rawWorld = player.heading + stickAng;       // where the thumb points, pre-clamp
+  // Aim-assist (the touch "handicap"): snap to the nearest enemy within a cone of where
+  // you point AND inside the vehicle's arc, so a human doesn't have to nail the angle.
+  let best = null, bestErr = ASSIST_CONE;
+  for (const v of combatants) {
+    if (v.dead || v === player || v.team === player.team) continue;
+    const dx = v.holder.position.x - hp.x, dz = v.holder.position.z - hp.z;
+    if (Math.hypot(dx, dz) > ASSIST_RANGE) continue;
+    const ang = Math.atan2(-dx, -dz);
+    if (Math.abs(wrapPi(ang - player.heading)) > arc + 1e-3) continue;   // outside the arc
+    const err = Math.abs(wrapPi(ang - rawWorld));
+    if (err < bestErr) { bestErr = err; best = v; }
+  }
+  const fire = touchAim.mag >= RIM_FIRE;
+  if (player.type === 'valkyrie') {
+    // Missile lock toward the assisted enemy, or the ground point you're pointing at.
+    if (best) setLock(best, best.holder.position);
+    else {
+      const ang = player.heading + desired;
+      _aimStickV.set(hp.x - Math.sin(ang) * 60, 0, hp.z - Math.cos(ang) * 60);
+      _aimStickV.y = map.heightAt(_aimStickV.x, _aimStickV.z) + 0.5;
+      setLock(null, _aimStickV);
+    }
+    fireHeld = fire;
+    return;
+  }
+  if (best) { _aimPoint = best.holder.position.clone(); _aimTargetVeh = best; }
+  else {
+    const ang = player.heading + desired;
+    _aimStickV.set(hp.x - Math.sin(ang) * 60, 0, hp.z - Math.cos(ang) * 60);
+    _aimStickV.y = map.heightAt(_aimStickV.x, _aimStickV.z) + 1.0;
+    _aimPoint = _aimStickV.clone(); _aimTargetVeh = null;
+  }
+  _aimValid = true;
+  fireHeld = fire;
+}
 
 // Reveal the on-screen touch controls only AFTER a real touch — capability flags
 // (maxTouchPoints / ontouchstart) are true on touchscreen laptops and many desktop
@@ -692,6 +796,14 @@ function elevatorPadAt(x, z) {
   return null;
 }
 
+// A vehicle still riding a FOB lift UP the shaft hasn't surfaced yet — down in the pit
+// it's out of sight, so it can't be SEEN, targeted or shot until its lift tops out. This
+// stops a unit camping the enemy's elevator mouth and shelling riders before they rise.
+function vehicleHidden(v) {
+  for (const e of elevators) if (e.rider === v && e.phase !== 'top') return true;
+  return false;
+}
+
 // Ground height a vehicle should rest at (terrain + a small clearance; or the deck).
 function vehicleGroundY(x, z) {
   const e = elevatorPadAt(x, z);
@@ -772,8 +884,8 @@ const VEH_MOVE = {
 const VEH_STATS = {
   lurcher:  { hp: 220, fuel: 200, burn: 2.4, ammo: 68, shield: 110 },
   firebrat: { hp: 90,  fuel: 200, burn: 3.0, ammo: 90, shield: 45  },
-  valkyrie: { hp: 140, fuel: 260, burn: 4.2, ammo: 24, shield: 75  },
-  jotun:    { hp: 320, fuel: 200, burn: 2.0, ammo: 12, shield: 160 },
+  valkyrie: { hp: 140, fuel: 260, burn: 4.2, ammo: 12, shield: 75  },
+  jotun:    { hp: 320, fuel: 200, burn: 2.0, ammo: 16, shield: 160 },
 };
 const SINK_RATE = 1.2;     // units/sec a land vehicle floods when over water
 const SINK_KILL = 2.5;     // depth at which it's fully submerged → destroyed
@@ -998,12 +1110,13 @@ function fireVehicle(veh, playSound, targetPoint = null, targetVeh = null, aimed
 function firePlayer() {
   if (!player || player.dead) return;
   if (playerIsValkyrie()) { fireVehicle(player, true, null); fireCooldown = player.cooldown; return; }
-  if (_cursor) {
-    // Mouse aim: only spend a shot when there's a valid firing solution (green reticle).
+  if (_cursor || touchAiming) {
+    // Mouse / aim-stick: only spend a shot when there's a valid firing solution. On touch
+    // updateTouchAim sets _aimPoint (+ _aimTargetVeh from aim-assist) and _aimValid.
     if (!_aimValid) return;
-    fireVehicle(player, true, _aimPoint, _aimTargetVeh);
+    fireVehicle(player, true, _aimPoint, _aimTargetVeh, !!_aimTargetVeh);
   } else {
-    fireVehicle(player, true, null);   // touch / no cursor → fire straight forward
+    fireVehicle(player, true, null);   // no cursor / no aim → fire straight forward
   }
   fireCooldown = player.cooldown;
 }
@@ -1073,7 +1186,7 @@ function pickWorldPoint(px, py) {
   ray.setFromCamera(ndc, camera);
   let best = null, bestAlong = Infinity;
   for (const v of combatants) {
-    if (v.dead || v === player || (player && v.team === player.team)) continue;
+    if (v.dead || v === player || (player && v.team === player.team) || vehicleHidden(v)) continue;
     const c = v.holder.position;
     if (ray.ray.distanceToPoint(c) < v.hitR + 2.5) {
       const along = ray.ray.origin.distanceToSquared(c);
@@ -1132,6 +1245,9 @@ function ensureAimReticle() {
   return g;
 }
 function updateAimReticle() {
+  // On touch the aim stick owns _aimPoint (set in updateTouchAim, earlier this frame) —
+  // leave it be and hide the desktop crosshair.
+  if (touchAiming) { if (aimReticle) aimReticle.visible = false; return; }
   _aimPoint = null; _aimValid = false; _aimTargetVeh = null;
   if (!onField || !player || player.dead || playerIsValkyrie() || !_cursor) { if (aimReticle) aimReticle.visible = false; return; }
   const t = pickWorldPoint(_cursor.x, _cursor.y);
@@ -1282,7 +1398,7 @@ function updateWallTurrets(dt) {
       // nearest enemy vehicle in range (turrets sit above the parapet → no wall-LOS check)
       let target = null, bestD = TURRET_RANGE * TURRET_RANGE;
       for (const v of combatants) {
-        if (v.dead || v.team === c.team) continue;
+        if (v.dead || v.team === c.team || vehicleHidden(v)) continue;   // can't shoot a unit still down its lift shaft
         const dx = v.holder.position.x - _tHead.x, dz = v.holder.position.z - _tHead.z;
         const d2 = dx * dx + dz * dz;
         if (d2 < bestD) { bestD = d2; target = v; }
@@ -1636,9 +1752,11 @@ function fortHpOf(team) {
 }
 // Live defensive turrets a team still has — the towers that actually shoot attackers.
 // The commander uses this for tower-first ordering (don't send a runner into live towers).
-function turretCountOf(team) {
+// Pass role='main' to count ONLY the flag-HQ camp's turrets (the ones that gate a flag
+// steal); the FOB/elevator turrets are optional and shouldn't hold back the win logic.
+function turretCountOf(team, role = null) {
   let n = 0;
-  for (const c of camps) if (c.team === team) for (const w of c.walls) {
+  for (const c of camps) if (c.team === team && (!role || c.role === role)) for (const w of c.walls) {
     const t = w.turret; if (t && !t.dead && !t.falling) n++;
   }
   return n;
@@ -2092,7 +2210,6 @@ class AICommander {
     recolorFlag(this.team, accent);
     const elev = elevators.find(e => e.team === this.team); if (elev) elev.setAccent(accent);
     this.fortHp0 = fortHpOf(this.targetTeam()) || 1;
-    this.targetTurrets0 = turretCountOf(this.targetTeam());   // baseline for tower-first ordering
     this.deploy();
   }
 
@@ -2116,12 +2233,12 @@ class AICommander {
     const kinds = new Set();
     for (const rp of this.knownSupplies) if (!rp.dead) kinds.add(rp.kind);
     const parts = [];
-    if (kinds.has('shield')) parts.push('Shield');
-    if (kinds.has('ammo')) parts.push('Ammo');
-    if (kinds.has('fuel')) parts.push('Fuel');
-    if (this.knownElev) parts.push('E_Elv');
-    if (this.knownFlag) parts.push('E_Flag');
-    return parts.length ? parts.join(', ') : 'none';
+    if (kinds.has('ammo')) parts.push('AMO');
+    if (kinds.has('fuel')) parts.push('FUL');
+    if (kinds.has('shield')) parts.push('SHD');
+    if (this.knownFlag) parts.push('FLG');     // enemy flag HQ
+    if (this.knownElev) parts.push('ELV');     // enemy elevator/FOB
+    return parts.length ? parts.join(' ') : 'none';
   }
   // Have we ever laid eyes on an enemy vehicle? (drives Hunter scout → attack)
   knowsEnemy() { return Object.keys(this.seenTypes).length > 0; }
@@ -2204,14 +2321,17 @@ class AICommander {
     return best;
   }
   fortFrac() { return this.fortHp0 ? fortHpOf(this.targetTeam()) / this.fortHp0 : 1; }
-  turretsLive() { return turretCountOf(this.targetTeam()); }
-  // Tower-first: the enemy fort is "breached" (safe to send a Firebrat runner) once
-  // its defensive turrets are mostly gone — not on a blind timer that walked the
-  // runner into live towers. No towers to begin with → breached immediately.
-  fortDown() {
-    const live = this.turretsLive();
-    return live === 0 || live <= (this.targetTurrets0 || 0) * 0.34;
-  }
+  // Only the FLAG-HQ (main camp) turrets gate the win — they guard the flag. The
+  // FOB/elevator turrets are optional (a unit still suppresses one that's shooting it,
+  // but they no longer hold back the runner or inflate the "towers left" readout).
+  turretsLive() { return turretCountOf(this.targetTeam(), 'main'); }
+  // Tower-first: the flag-HQ is "breached" (safe to send a Firebrat runner) only once
+  // ALL its turrets are down. A single live tower over the flag will shred the runner on
+  // the grab, so we don't commit one until the defenses are fully silenced.
+  fortDown() { return this.turretsLive() === 0; }
+  // The runner only goes when the flag is both EXPOSED (HQ building rubble) and its
+  // turrets are DOWN — otherwise it's sent to die over a guarded or sealed flag.
+  flagGrabbable() { return this.flagExposed() && this.fortDown(); }
   // The enemy flag is sealed inside its HQ until that building is rubble. The
   // runner can't grab it before then, so the heavy must finish the HQ first —
   // strategy cards gate the open→grab handoff on this.
@@ -2286,7 +2406,11 @@ class AICommander {
     if (this.explore.fraction() > 0.8) return null;        // map's mostly mapped — stop wandering
     const px = v.holder.position.x, pz = v.holder.position.z;
     if (this._exploreWp) {
-      const reach = this.explore.cell * 0.8;
+      // Clear (and repick a farther) waypoint BEFORE the unit gets close enough that the
+      // seek behavior parks on it (it stops within arriveDist). If the clear-radius were
+      // smaller than arriveDist, a waypoint landing in that dead zone would freeze the
+      // scout: arrived (so it stops) but not cleared (so it never picks a new target).
+      const reach = this.strategy.arriveDist(this) + 8;
       if ((this._exploreWp.x - px) ** 2 + (this._exploreWp.z - pz) ** 2 < reach * reach) this._exploreWp = null;
     }
     if (!this._exploreWp) { const home = this.homePos(); this._exploreWp = this.explore.pickTarget(px, pz, home.x, home.z); }
@@ -2298,7 +2422,7 @@ class AICommander {
   get cname() { return teamLabel(this.colorIndex); }
 
   // Draw a fresh card (on repeated losses / stalls) — keeps the AI unpredictable.
-  redraw() { this.strategy = makeDoctrine(this.archetype, this.personality, Math.random, this.strategy.constructor, m => aiLog(this.team, `${this.cname} ${m}`)); this.fortHp0 = fortHpOf(this.targetTeam()) || this.fortHp0; this.targetTurrets0 = turretCountOf(this.targetTeam()); this.failStreak = 0; aiLog(this.team, `${this.cname} regroups (new plan)`); }
+  redraw() { this.strategy = makeDoctrine(this.archetype, this.personality, Math.random, this.strategy.constructor, m => aiLog(this.team, `${this.cname} ${m}`)); this.fortHp0 = fortHpOf(this.targetTeam()) || this.fortHp0; this.failStreak = 0; aiLog(this.team, `${this.cname} regroups (new plan)`); }
 
   deploy() {
     const want = this.strategy.wantVehicle(this);
@@ -2451,7 +2575,10 @@ class AICommander {
     const st = cmd.state;
     let dest = null, slack = 9;
     if (st === 'exit') { dest = this._exit || this.strategy.objective(this); slack = 5; }   // thread the gate via A*
-    else if (st === 'advance') dest = this.strategy.objective(this);
+    // Use the RESOLVED goal the brain is acting on (view.goal already folds in the shield-grab
+    // and intercept detours), not the raw mission objective — else a ground unit's A* steers it
+    // to the patrol/objective spot while it claims to be "grabbing a shield" and never gets there.
+    else if (st === 'advance') dest = view.goal || this.strategy.objective(this);
     else if (st === 'pursue') dest = v.ai.lastSeen || this.strategy.objective(this);
     else if (st === 'retreat') dest = this._home;          // heal at own base (only place HP regens)
     else if (st === 'resupply') dest = this._supply;       // nearest fuel/ammo (own base or a depot)
@@ -2556,7 +2683,6 @@ class AICommander {
         // Firebrat into the exact same death.
         if (this.unit.type === 'firebrat' && this.strategy.step === 'capture') {
           this.strategy.onRunnerLost(this);
-          this.targetTurrets0 = turretCountOf(this.targetTeam());
           aiLog(this.team, `${this.cname} runner down — re-softening (towers still up)`);
         }
         // Keep losing the same way? Each repeat raises the odds of a brand-new plan — but
@@ -2618,9 +2744,17 @@ class AICommander {
     const flyer = v._move.ignoreWalls;
     this.explore.mark(px, pz, AI_VISION * 0.7);   // paint this patch of map "known" for the team's recon memory
     let seesEnemy = false, enemy = null, seen = null, best = AI_VISION * AI_VISION;
+    // Local-brawl headcount for the fight-or-flight weight: how many rivals vs friendlies
+    // are within striking distance of THIS unit (so it breaks off a losing gang-fight and
+    // presses when it has the numbers). Counted by proximity (LOS-independent — being
+    // surrounded matters even if one foe ducks behind cover for a beat).
+    let enemiesNear = 0, alliesNear = 0;
+    const FIGHT_R2 = 48 * 48;
     for (const o of combatants) {                       // nearest VISIBLE rival of any other team
-      if (o.dead || o.team === this.team) continue;
+      if (o.dead || vehicleHidden(o)) continue;          // a unit still down the lift shaft isn't on the field yet
       const d = (o.holder.position.x - px) ** 2 + (o.holder.position.z - pz) ** 2;
+      if (o.team === this.team) { if (o !== v && d < FIGHT_R2) alliesNear++; continue; }
+      if (d < FIGHT_R2) enemiesNear++;
       if (d < best && (flyer || hasLOS(px, pz, o.holder.position.x, o.holder.position.z))) {
         best = d; enemy = { x: o.holder.position.x, y: o.holder.position.y, z: o.holder.position.z, type: o.type, shield: o.shield, vx: o._vx || 0, vz: o._vz || 0,
           hpFrac: o.maxHp ? o.hp / o.maxHp : 1, retreating: o._aiState === 'retreat' || o._aiState === 'resupply' }; seen = o; seesEnemy = true;
@@ -2652,10 +2786,8 @@ class AICommander {
       if (!this.knownElev) { const e = this.enemyFobPos(); const d2 = (e.x - px) ** 2 + (e.z - pz) ** 2; if (d2 < bSight * bSight && (flyer || hasLOS(px, pz, e.x, e.z))) this.knownElev = true; }
       if (!this.knownFlag) { const e = this.enemyBasePos(); const d2 = (e.x - px) ** 2 + (e.z - pz) ** 2; if (d2 < bSight * bSight && (flyer || hasLOS(px, pz, e.x, e.z))) this.knownFlag = true; }
     }
-    // Log the set of points this team is aware of — only when it CHANGES (a new discovery
-    // or a known supply destroyed), so it reads as intel updates, not spam. Shows in ?ailog.
-    const ks = this._knownSummary();
-    if (ks !== this._knownSig) { this._knownSig = ks; aiLog(this.team, `${this.cname} knows: ${ks}`); }
+    // The set of points this team is aware of is read live into the log's per-team box
+    // (a persistent status line), so it's no longer logged as a rolling event.
     let goal = this.strategy.objective(this);
     // DEFEND override (ai_behavior): if a rival is running off with OUR flag, abandon the
     // plan and chase the carrier toward its delivery point — so a stolen flag is always
@@ -2683,24 +2815,29 @@ class AICommander {
       }
     }
     // Where to rearm/refuel: the NEAREST valid source for what we need — own base
-    // (always restocks fuel + ammo) OR a DISCOVERED neutral depot. A neutral depot
-    // gives just ONE resource, but the brain only clears the resupply latch when BOTH
-    // fuel AND ammo are back up (DEFAULT_BRAIN.config fuelFull 0.5 / ammoFull 0.6). So
-    // a unit that's low on BOTH must go to its base — otherwise it tops off the one
-    // thing the depot offers, the latch stays stuck on the other, and it camps the
-    // tank forever (the "Jotun parked at a fuel supply" bug). Only divert to a single-
-    // resource depot when that resource is the ONLY one still under its restock line.
+    // (always restocks fuel + ammo) OR a DISCOVERED neutral depot. A neutral depot gives
+    // just ONE resource, so we only divert to one when topping it gets the unit combat-
+    // ready (the OTHER resource is still OK enough to fight/move on — config fuelOK 0.25 /
+    // ammoOK 0.5, matching the depot latch-clear). Only when BOTH are genuinely low does it
+    // trek to base for the full top-off + heal — otherwise it tops the one thing the depot
+    // offers, the latch (which still wants the other) stays stuck, and it camps the tank
+    // forever (the "Jotun parked at a fuel supply" bug). NOTE: a unit that ran dry on AMMO
+    // with HALF a tank used to be dragged all the way to base, because "low fuel" was set
+    // at <0.5 — far above the point fuel actually needs topping. Now it grabs ammo at the
+    // nearest depot and gets back in the fight, refuelling separately only if fuel gets low.
     const fob = teamCamp(this.team, 'fob'), home = teamCamp(this.team, 'main');
-    const lowAmmo = v.ammo < v.maxAmmo * 0.6;       // matches config.ammoFull (latch clear)
-    const lowFuel = v.fuel < v.maxFuel * 0.5;       // matches config.fuelFull (latch clear)
+    const needAmmo = v.ammo < v.maxAmmo * 0.6;      // want to top ammo (config.ammoFull)
+    const needFuel = v.fuel < v.maxFuel * 0.5;      // want to top fuel (config.fuelFull)
+    const fuelOk = v.fuel >= v.maxFuel * 0.25;      // still enough gas to keep going (config.fuelOK)
+    const ammoOk = v.ammo >= v.maxAmmo * 0.5;       // still enough rounds to keep fighting (config.ammoOK)
     let supply = null, bestD = Infinity, supplyHeals = false;
     // isBase = an OWN base (restocks fuel + ammo AND patches the hull); a depot does not.
     const consider = (x, z, isBase) => { const d = (px - x) ** 2 + (pz - z) ** 2; if (d < bestD) { bestD = d; supply = { center: { x, z } }; supplyHeals = isBase; } };
     if (fob) consider(fob.center.x, fob.center.z, true);
     if (home && flagBaseAlive(this.team)) consider(home.center.x, home.center.z, true);   // a levelled flag base resupplies no one
-    // A neutral depot is only worth the detour if topping its one resource fully clears
-    // the latch — i.e. it's the single low resource. Both low → base only (above).
-    const depotKind = (lowAmmo && !lowFuel) ? 'ammo' : (lowFuel && !lowAmmo) ? 'fuel' : null;
+    // Divert to a single-resource depot when it fixes the actual need AND the other
+    // resource is still OK (so the latch will clear there). Both genuinely low → base only.
+    const depotKind = (needAmmo && fuelOk) ? 'ammo' : (needFuel && ammoOk) ? 'fuel' : null;
     if (depotKind) for (const rp of resupplies) if (!rp.dead && rp.kind === depotKind && this.knownSupplies.has(rp)) consider(rp.pos.x, rp.pos.z, false);
     this._supply = supply ? { x: supply.center.x, z: supply.center.z } : null;   // nav target while resupplying
     this._supplyHeals = supplyHeals;   // chosen supply is an own base → hold for a FULL top-off (ammo+fuel+hp)
@@ -2807,7 +2944,7 @@ class AICommander {
     return {
       dt,
       self: { x: px, z: pz, heading: h, type: v.type, shield: v.shield, hpFrac: v.hp / v.maxHp, fuelFrac: v.fuel / v.maxFuel, ammoFrac: v.ammo / v.maxAmmo },
-      seesEnemy, enemy, flyer, shotArc: SHOT_ARC[v.type] ?? Math.PI / 5,
+      seesEnemy, enemy, enemiesNear, alliesNear, flyer, shotArc: SHOT_ARC[v.type] ?? Math.PI / 5,
       // shot-feedback: ≥2 of our recent rounds (last ~2s) detonated on terrain/cover, not on
       // the enemy → the firing lane is blocked; the combat brain sidesteps to clear it.
       shotBlocked: (v._blockedShots || 0) >= 2 && (performance.now() - (v._lastBlockT || 0)) < 2000,
@@ -3015,7 +3152,7 @@ function ensureLogStyle() {
     #ai-log { position:fixed; z-index:150; pointer-events:none; font-family:"Courier New",monospace;
       color:#dfe8ef; background:rgba(8,12,18,0.8); border:1px solid rgba(255,255,255,0.18);
       border-radius:6px; text-shadow:0 1px 2px rgba(0,0,0,0.8); font-variant-numeric:tabular-nums; }
-    #ai-log.brief { top:12px; right:12px; width:330px; max-width:82vw; }
+    #ai-log.brief { top:12px; right:12px; width:360px; max-width:90vw; }
     #ai-log.full  { inset:10px; pointer-events:auto; display:flex; flex-direction:column; }
     #ai-log-head { display:flex; align-items:center; justify-content:space-between; pointer-events:auto;
       padding:6px 6px 6px 9px; border-bottom:1px solid rgba(255,255,255,0.14); }
@@ -3025,9 +3162,18 @@ function ensureLogStyle() {
       border:1px solid rgba(255,255,255,0.3); border-radius:5px; background:rgba(255,255,255,0.07);
       font-weight:bold; font-size:16px; user-select:none; -webkit-user-select:none; touch-action:manipulation; }
     #ai-log .lg-btn:active { background:rgba(255,255,255,0.22); }
-    #ai-log-body { padding:8px 10px; font-size:11px; line-height:1.45; letter-spacing:0.5px; white-space:pre; }
+    #ai-log-body { padding:7px 8px; font-size:11px; line-height:1.4; letter-spacing:0.2px; white-space:pre-wrap; }
     #ai-log.brief #ai-log-body { overflow:hidden; }
-    #ai-log.full  #ai-log-body { overflow-y:auto; flex:1; -webkit-overflow-scrolling:touch; }`;
+    #ai-log.full  #ai-log-body { overflow-y:auto; flex:1; -webkit-overflow-scrolling:touch; }
+    /* One box per team: status (mission/known/fleet) + that team's latest event. */
+    #ai-log .tbox { border-left:3px solid #888; border-radius:4px; background:rgba(255,255,255,0.035);
+      padding:4px 8px; margin:0 0 6px; }
+    #ai-log .tbox:last-child { margin-bottom:0; }
+    #ai-log .tb-h { font-weight:bold; letter-spacing:0.6px; font-size:12px; }
+    #ai-log .tb-l { opacity:0.82; }
+    #ai-log .tb-ev { margin-top:3px; opacity:0.95; }
+    #ai-log .tb-t { opacity:0.6; }
+    #ai-log .tb-feed { margin-top:4px; border-top:1px solid rgba(255,255,255,0.14); padding-top:6px; opacity:0.92; }`;
   document.head.appendChild(s);
 }
 function ensureAiLogEl() {
@@ -3049,35 +3195,60 @@ function ensureAiLogEl() {
   document.body.appendChild(el);
   return el;
 }
+// Trim a log event down to just its CHANGING part for a team's brief box: the box
+// already shows the team colour, vehicle and personality, so drop a leading "COLOUR"
+// (and a following vehicle-type word) and a trailing "[card]".
+const _VTYPES = ['firebrat', 'lurcher', 'valkyrie', 'jotun'];
+function briefEvent(cmd, msg) {
+  let m = msg;
+  if (cmd.cname && m.toUpperCase().startsWith(cmd.cname.toUpperCase())) m = m.slice(cmd.cname.length);
+  m = m.replace(/^[\s:·—-]+/, '');                                   // leading separators
+  for (const t of _VTYPES) if (m.toLowerCase().startsWith(t)) { m = m.slice(t.length).replace(/^[\s:·—-]+/, ''); break; }
+  m = m.replace(/\s*\[[^\]]*\]\s*$/, '');                            // trailing [card]
+  return m.trim();
+}
 function updateAiLog() {
   const el = document.getElementById('ai-log');
   if (aiLogMode === 'hidden') { if (el) el.style.display = 'none'; return; }
   const box = ensureAiLogEl(); box.style.display = '';
   box.className = aiLogMode;
   document.getElementById('ai-log-title').textContent = aiLogMode === 'full' ? 'AI LOG · PAUSED' : 'AI LOG';
+  // The most-recent event for a team (its "running" line), or null.
+  const latestFor = team => { for (let i = aiEvents.length - 1; i >= 0; i--) if (aiEvents[i].team === team) return aiEvents[i]; return null; };
   let html = '';
+  // ONE BOX PER TEAM. Each box = that team's persistent status (the mission, the known
+  // POIs, fleet) PLUS its single latest event — so a team's whole picture sits together,
+  // identified by its colour, instead of all status then a shared event feed.
   for (const cmd of commanders) {
-    const d = cmd._dbg;
     const col = teamLogColor(cmd.team);
-    if (!d) { html += `<span style="color:${col}">${cmd.cname} — deploying…\n  fleet ${fleetStr(cmd)}</span>\n`; continue; }
-    html += `<span style="color:${col}">${d.name} ${d.type} ${d.card}  enemyTwrs:${d.towers}\n`;
-    html += `  ${d.state}  blk:${d.blk}  f/t:${d.fwd}/${d.turn}\n`;
-    if (d.stuck) html += `  ⚠ STUCK ${d.stuck}s — ${d.stuckWhy}\n`;
-    html += `  hp:${d.hp}% ammo:${d.ammo} fuel:${d.fuel}  fob:${d.distFob}u\n`;
-    html += `  fleet ${fleetStr(cmd)}</span>\n`;
-  }
-  html += '<span style="opacity:0.55">────────────</span>\n';
-  const line = e => `<span style="opacity:0.8">${e.t.toFixed(0)}s</span> <span style="color:${teamLogColor(e.team)}">${e.msg}</span>\n`;
-  if (aiLogMode === 'brief') {
-    // Brief: the single most-recent event from EACH team (one line per commander),
-    // shown in team order so it doesn't flip around as events come in.
-    for (const cmd of commanders) {
-      for (let i = aiEvents.length - 1; i >= 0; i--) {
-        if (aiEvents[i].team === cmd.team) { html += line(aiEvents[i]); break; }
-      }
+    const d = cmd._dbg;
+    const mission = (cmd.strategy && cmd.strategy.step ? cmd.strategy.step : '—').toUpperCase();
+    const known = cmd._knownSummary ? cmd._knownSummary() : 'none';
+    const type = d ? d.type.toUpperCase() : 'DEPLOYING';
+    const card = d ? d.card : (cmd.strategy ? (cmd.strategy.constructor.name || '').replace('Strategy', '') : '');
+    html += `<div class="tbox" style="border-color:${col}">`;
+    // Header: COLOUR · VEHICLE · MISSION · PERSONALITY — all dot-separated, no brackets.
+    html += `<div class="tb-h" style="color:${col}">${cmd.cname} · ${type} · ${mission}${card ? ` · ${card.toUpperCase()}` : ''}</div>`;
+    if (d) {
+      html += `<div class="tb-l">${d.state} · hp ${d.hp}% · ammo ${d.ammo} · fuel ${d.fuel} · fob ${d.distFob}</div>`;
+      if (d.stuck) html += `<div class="tb-l" style="color:#ffb030">⚠ STUCK ${d.stuck}s — ${d.stuckWhy}</div>`;
     }
-  } else {
-    for (let i = aiEvents.length - 1; i >= 0; i--) html += line(aiEvents[i]);
+    html += `<div class="tb-l">twrs ${d ? d.towers : '?'} · knows ${known}</div>`;
+    html += `<div class="tb-l">fleet ${fleetStr(cmd)}</div>`;
+    const ev = latestFor(cmd.team);
+    // The box already names the team/vehicle/personality, so the event shows only the
+    // changing part (front "COLOUR vehicle:" + trailing "[card]" stripped).
+    if (ev) html += `<div class="tb-ev" style="color:${col}"><span class="tb-t">${ev.t.toFixed(0)}s</span> ${briefEvent(cmd, ev.msg)}</div>`;
+    html += `</div>`;
+  }
+  // Full view also gets the whole chronological feed below the boxes (scrollable).
+  if (aiLogMode === 'full') {
+    html += `<div class="tb-feed">`;
+    for (let i = aiEvents.length - 1; i >= 0; i--) {
+      const e = aiEvents[i];
+      html += `<div><span class="tb-t">${e.t.toFixed(0)}s</span> <span style="color:${teamLogColor(e.team)}">${e.msg}</span></div>`;
+    }
+    html += `</div>`;
   }
   document.getElementById('ai-log-body').innerHTML = html;
 }
@@ -3224,6 +3395,7 @@ function deployToFOB(type, colorIndex, rise) {
   player = v;
   initCombatant(v, PLAYER_TEAM, colorIndex, true);
   updatePlayerHud();
+  refreshAimArc();            // aim-stick wedge matches the deployed vehicle's arc
   startCommanders(colorIndex);   // AI teams pick remaining colours + deploy in response
   leftPad = false;            // must drive off the pad before a park can return it
   parkT = 0;
@@ -3233,7 +3405,7 @@ function deployToFOB(type, colorIndex, rise) {
   updateCamera();
 }
 
-// Forward/turn in [-1, 1]. Touch: steer toward the held finger (point-to-steer).
+// Forward/turn in [-1, 1]. Touch: the left on-screen stick sets the same WASD keys.
 // Keyboard (desktop): WASD/arrows, the classic tank turn + throttle.
 function driveInput() {
   // The Lurcher has NO front (omni-directional): it moves along whatever world vector you
@@ -3300,6 +3472,7 @@ function driveUpdate(dt) {
   if (playerElev && player && playerElev.rider === player && playerElev.phase === 'top') {
     playerElev.rider = null;   // detach so drive() owns the transform
     driving = true;
+    refreshAimArc();           // tint the aim wedge to this vehicle's arc, now that it's live
   }
   if (!driving || !player || player.dead) return false;
   const inp = matchOver ? { fwd: 0, turn: 0, strafe: 0 } : driveInput();   // controls freeze on win
@@ -3451,16 +3624,18 @@ function setGarageOverlays(show) {
 function setFieldUI(show) {
   const hud = document.getElementById('hud');
   if (hud) hud.style.display = show ? '' : 'none';
-  // Touch controls: the drive STICK stays retired (touch steers toward the finger on the
-  // field), but the corner FIRE buttons are revealed on touch devices so firing is reliable
-  // — one thumb steers, the other fires (tapping the field for a shot was too fiddly).
-  document.getElementById('touch-joystick')?.classList.remove('visible');
+  // Touch controls: two fixed sticks — LEFT drives (WASD), RIGHT aims+fires within the
+  // vehicle's arc with aim-assist. The old corner FIRE buttons + field point-to-steer are
+  // retired (firing-by-cursor was unreliable; getting exact angles by thumb was too hard).
+  const onTouch = show && touchUsed;
+  document.getElementById('touch-joystick')?.classList.toggle('visible', onTouch);
+  document.getElementById('touch-aim')?.classList.toggle('visible', onTouch);
   for (const id of ['fire-btn', 'fire-btn-l']) {
-    const el = document.getElementById(id);
-    if (el) el.classList.toggle('visible', show && touchUsed);
+    document.getElementById(id)?.classList.remove('visible');
   }
+  if (show) refreshAimArc();   // tint the aim wedge to the deployed vehicle's arc
   ensureLogToggle(); updateLogToggle();   // phone-friendly AI-log button (top-right)
-  if (!show) fireHeld = false;   // don't carry a held shot back into the garage
+  if (!show) { fireHeld = false; touchAim = null; touchAiming = false; }   // drop a held shot at the garage
 }
 // Top-right LOG button (where the old map ⚙ sat) — reveals the log from hidden. It
 // only shows while the field is up and the log is hidden; once open, the box's own
@@ -3983,6 +4158,12 @@ window.RR = {
   acquireLock: (px, py) => acquireLock(px, py),
   tickDrive: (dt = 0.1) => driveUpdate(dt),
   refreshHud: () => updatePlayerHud(),
+  // --- touch aim-stick test hooks ---
+  setAimStick: (nx, ny, mag) => { touchAim = { nx, ny, mag: mag == null ? Math.hypot(nx, ny) : mag }; },
+  clearAimStick: () => { touchAim = null; touchAiming = false; fireHeld = false; },
+  tickTouchAim: () => updateTouchAim(),
+  get touchAimState() { return { aiming: touchAiming, fireHeld, aimPoint: _aimPoint ? { x: _aimPoint.x, y: _aimPoint.y, z: _aimPoint.z } : null, target: _aimTargetVeh ? _aimTargetVeh.type : null, valid: _aimValid }; },
+  showTouchControls: () => { touchUsed = true; if (onField) setFieldUI(true); },
   // --- targeting test hooks ---
   setCursor: (px, py) => { _cursor = { x: px, y: py }; },
   refreshReticle: () => updateAimReticle(),
@@ -4148,6 +4329,7 @@ function animate() {
     if (garage.phase === 'done') enterField();
   } else {
     if (!paused) {                         // full-screen log freezes the whole sim
+      updateTouchAim();                      // aim stick → _aimPoint/fireHeld (before drive reads them)
       if (!driveUpdate(dt)) spectateUpdate(dt) || panUpdate(dt);   // player, else follow the action / free cam
       trackVelocities(dt);                 // per-vehicle velocity for AI aim-leading
       if (!matchOver) updateCommanders(dt);  // AI teams (fog-of-war) + flag carry/capture — frozen on win

@@ -9,18 +9,40 @@ let _id = 0;
 // Progressive battle-damage look. Scorch = the colour a battered surface fades toward.
 const SCORCH = new THREE.Color('#241f1b');
 const CRACK_STAGES = 4;
-// Draw a few jagged dark fractures (with a faint highlight for depth) onto a texture
-// canvas. Called cumulatively — each stage scratches more cracks over the last.
+// Draw an IMPACT FRACTURE onto a texture canvas: cracks radiate out from a single
+// point (a hit), zigzagging and forking like a shattered panel — not scattered loose
+// segments. Called cumulatively (each stage = a new impact star as HP falls). One-off
+// canvas draw per stage (≤4 over a prop's life), so no per-frame cost.
 function drawCracks(ctx, w, h, frac) {
   ctx.lineCap = 'round';
-  const n = 2 + Math.floor(frac * 4);
-  for (let i = 0; i < n; i++) {
-    let x = Math.random() * w, y = Math.random() * h;
-    ctx.beginPath(); ctx.moveTo(x, y);
-    const segs = 3 + (Math.random() * 3 | 0);
-    for (let s = 0; s < segs; s++) { x += (Math.random() - 0.5) * w * 0.5; y += (Math.random() - 0.5) * h * 0.5; ctx.lineTo(x, y); }
-    ctx.strokeStyle = 'rgba(15,12,9,0.9)'; ctx.lineWidth = 1 + Math.random() * 1.6; ctx.stroke();
-    ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 1; ctx.stroke();
+  ctx.lineJoin = 'round';
+  // Impact origin — somewhere on the face, biased away from the very edges.
+  const ox = w * (0.2 + Math.random() * 0.6), oy = h * (0.2 + Math.random() * 0.6);
+  const rays = 5 + Math.floor(frac * 6);          // more fractures the more battered it is
+  const reach = Math.min(w, h) * (0.22 + frac * 0.32);
+  // A small dark impact blotch at the centre, so the star reads as a HIT.
+  ctx.fillStyle = 'rgba(15,12,9,0.5)';
+  ctx.beginPath(); ctx.arc(ox, oy, 1.5 + frac * 2.5, 0, Math.PI * 2); ctx.fill();
+
+  const drawRay = (sx, sy, ang0, len, width) => {
+    let x = sx, y = sy, ang = ang0;
+    const steps = 3 + (Math.random() * 3 | 0), step = len / steps;
+    for (let s = 0; s < steps; s++) {
+      ang += (Math.random() - 0.5) * 0.9;         // zigzag wobble along the crack
+      const nx = x + Math.cos(ang) * step, ny = y + Math.sin(ang) * step;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(nx, ny);
+      const wd = width * (1 - s / steps) + 0.4;   // taper from thick at the origin to a hairline
+      ctx.strokeStyle = 'rgba(15,12,9,0.9)'; ctx.lineWidth = wd; ctx.stroke();
+      ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = Math.max(0.5, wd * 0.5); ctx.stroke();
+      // occasional fork partway out (one level deep — keeps it cheap)
+      if (width > 1 && s > 0 && Math.random() < 0.28)
+        drawRay(nx, ny, ang + (Math.random() - 0.5) * 1.7, step * (1 + Math.random()), wd * 0.7);
+      x = nx; y = ny;
+    }
+  };
+  for (let i = 0; i < rays; i++) {
+    const ang = (i / rays) * Math.PI * 2 + (Math.random() - 0.5) * 0.7;
+    drawRay(ox, oy, ang, reach * (0.5 + Math.random() * 0.7), 1.8 + Math.random() * 0.8);
   }
 }
 
@@ -108,7 +130,7 @@ export class Destructible {
     const sev = this.maxHp ? 1 - Math.max(0, this.hp) / this.maxHp : 0;
     if (sev <= 0) return;
     if (!this._unique) this._makeUnique();
-    for (const u of this._unique) if (u.base) u.mat.color.copy(u.base).lerp(SCORCH, sev * 0.55);
+    for (const u of this._unique) if (u.base) u.mat.color.copy(u.base).lerp(SCORCH, sev * 0.65);
     const stage = Math.min(CRACK_STAGES, Math.ceil(sev * CRACK_STAGES));
     while (this._stage < stage) {
       this._stage++;
@@ -131,19 +153,18 @@ export class Destructible {
     if (this.onDestroyed) this.onDestroyed(this);
   }
 
-  // Per-frame: white flash decays; a damaged prop keeps a faint warm ember glow at its
-  // cracks so you can read how hurt it is. Only touches materials while flashing/damaged
-  // (and by then they've been cloned, so this never leaks onto other props).
+  // Per-frame: the white hit-flash decays to nothing. Sustained battle damage is read
+  // from the DARKENED surface (the scorch lerp in _applyWear) + the crack fractures —
+  // no coloured ember glow (a damaged prop should just look charred, not lit red). Only
+  // touches materials while the flash is live (by then they've been cloned).
   update(dt) {
-    if (this.dead) return;
-    if (this._flash > 0) this._flash = Math.max(0, this._flash - dt * 3.2);
-    const sev = this.maxHp ? 1 - Math.max(0, this.hp) / this.maxHp : 0;
-    if (this._flash <= 0 && sev <= 0) return;
+    if (this.dead || this._flash <= 0) return;
+    this._flash = Math.max(0, this._flash - dt * 3.2);
     const k = this._flash;
     this.mesh.traverse(o => {
       if (!o.isMesh || !o.material) return;
       const arr = Array.isArray(o.material) ? o.material : [o.material];
-      for (const m of arr) if (m.emissive) m.emissive.setRGB(k + sev * 0.16, k * 0.85, k * 0.7);
+      for (const m of arr) if (m.emissive) m.emissive.setRGB(k, k, k);   // neutral white flash → dark
     });
   }
 }

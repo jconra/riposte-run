@@ -22,8 +22,6 @@
 import { COUNTER } from './AIStrategies.js?v=64';   // rock-paper-scissors web for fight-or-flight matchups
 
 const TYPES = ['lurcher', 'firebrat', 'valkyrie', 'jotun'];
-const CALLSIGNS = ['Viper', 'Rook', 'Ghost', 'Talon', 'Hammer', 'Wraith', 'Jackal',
-                   'Cinder', 'Bolt', 'Reaver', 'Specter', 'Mauler', 'Onyx', 'Karn'];
 
 // AI combat handicap — the single knob for "how hard does the AI hit". A human on a
 // touchscreen can't out-aim a perfect bot, so the opponents are deliberately reined in:
@@ -46,7 +44,6 @@ export function randomPersonality(rng = Math.random) {
     // ammo (then has to peel off and reload); low = patient: tries to skirt first.
     triggerHappy: clamp01(0.15 + rng() * 0.85),
     pref: TYPES[(rng() * TYPES.length) | 0],
-    name: CALLSIGNS[(rng() * CALLSIGNS.length) | 0],
   };
 }
 
@@ -56,8 +53,13 @@ function wrapPi(a) { while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) 
 
 // Fraction of ammo remaining (treat "unknown" as full, matching the old behaviour).
 function ammoFrac(view) { return view.self.ammoFrac != null ? view.self.ammoFrac : 1; }
-// Pull-out HP threshold: brave brains hold longer (0.27–0.45 across aggression).
-function bailOf(p, cfg) { return cfg.bailBase - p.aggression * cfg.bailAggr; }
+// Pull-out HP threshold: brave brains hold longer (0.27–0.45 across aggression). The
+// Jotun is the exception — it's far too slow to flee (a crawling retreat just gets it
+// shot in the back), so it holds and keeps firing down to nearly dead.
+function bailOf(p, cfg, type) {
+  if (type === 'jotun') return 0.12;
+  return cfg.bailBase - p.aggression * cfg.bailAggr;
+}
 
 // FIGHT-OR-FLIGHT WEIGHT — should this unit pick a fight with the rival it sees, or
 // keep moving and avoid it? A signed score: > 0 = fight, <= 0 = don't engage (carry on
@@ -71,12 +73,23 @@ function fightScore(v, p) {
   w += (p.aggression - 0.45) * 2;                                 // brave brains press
   w -= (p.defensiveness - 0.4) * 1.2;                             // cautious brains hold back
   if (s.type === 'firebrat') w -= 1.2;                            // fragile — dies in a hit or two
+  // NUMBERS: our local headcount (this unit + nearby friendlies) vs nearby rivals. Even
+  // odds is neutral; outnumbered tilts toward breaking off, having the numbers toward
+  // ganging up. Only weighed when rivals are actually close (a far sighting isn't a brawl).
+  if (v.enemiesNear > 0) w += (((v.alliesNear || 0) + 1) - v.enemiesNear) * 1.5;
+  // CROSSFIRE: pinned by a wall-turret AND a rival at once is a losing trade — don't stand
+  // and duel under tower fire (the hurt-latch then pulls it out as it takes damage).
+  if (v.threat && v.enemy) w -= 3;
   if (v.enemy) {
     if (v.enemy.shield > 0) w -= 1;                               // they're harder to crack
     const et = v.enemy.type;
     if (et && COUNTER[et] === s.type) w += 1.6;                   // we counter them → press
     if (et && COUNTER[s.type] === et) w -= 1.8;                   // they counter us → avoid
   }
+  // The Jotun can't run, so it doesn't: as long as it has ammo it stands, swings the
+  // railgun onto the target and fights regardless of the odds. (Out of ammo, it falls
+  // through to the normal score so the resupply latch can still pull it home.)
+  if (s.type === 'jotun' && s.ammoFrac > 0) return Math.max(w, 1);
   return w;
 }
 
@@ -110,7 +123,7 @@ const CONDITIONS = {
   // hp/ammo/matchup), otherwise keep moving instead of trading into a loss.
   engaging: (v, m, p) => v.seesEnemy && fightScore(v, p) > 0,
   // A wall-turret is shelling us and we still have teeth → silence it first.
-  threatened: (v, m, p, cfg) => !!v.threat && ammoFrac(v) > 0 && v.self.hpFrac > bailOf(p, cfg),
+  threatened: (v, m, p, cfg) => !!v.threat && ammoFrac(v) > 0 && v.self.hpFrac > bailOf(p, cfg, v.self.type),
   // Chase a recent sighting, but only brave brains bother — and never chase a ghost once
   // the enemy fleet is gone (the commander redirects to the base instead of wasting time).
   pursuing: (v, m, p) => {
@@ -122,12 +135,15 @@ const CONDITIONS = {
   // --- latch triggers ---
   resupNeeded: (v, m, p, cfg) => ammoFrac(v) <= 0 || v.self.fuelFrac < cfg.fuelLow,
   // At an OWN BASE (which also patches the hull) hold until ammo, fuel AND hp are ALL
-  // topped off — don't roll back out half-healed. At a single-resource depot, clear on
-  // the usual restock lines (it can't fill the others, so waiting would camp it forever).
+  // topped off — don't roll back out half-healed. At a single-resource depot, clear once
+  // the resource it fills is topped AND the OTHER one is merely "OK to carry on" (not full
+  // — the depot can't fill it, so requiring full would camp it forever). This is the match
+  // to the routing: a unit only diverts to the ammo depot when fuel is already ≥ fuelOK.
   resupDone:   (v, m, p, cfg) => v.supplyHeals
     ? (ammoFrac(v) >= cfg.topFull && v.self.fuelFrac >= cfg.topFull && v.self.hpFrac >= cfg.topFull)
-    : (ammoFrac(v) > cfg.ammoFull && v.self.fuelFrac > cfg.fuelFull),
-  hurtNeeded:  (v, m, p, cfg) => v.self.hpFrac < bailOf(p, cfg),
+    : ((ammoFrac(v) >= cfg.ammoFull && v.self.fuelFrac >= cfg.fuelOK) ||
+       (v.self.fuelFrac >= cfg.fuelFull && ammoFrac(v) >= cfg.ammoOK)),
+  hurtNeeded:  (v, m, p, cfg) => v.self.hpFrac < bailOf(p, cfg, v.self.type),
   hurtDone:    (v, m, p, cfg) => v.self.hpFrac > cfg.hurtClear,
 };
 
@@ -468,8 +484,10 @@ export const DEFAULT_BRAIN = {
     bailAggr: 0.18,
     hurtClear: 0.8,      // hp fraction that clears the "hurt" retreat latch
     fuelLow: 0.18,       // fuel fraction that trips the resupply latch
-    fuelFull: 0.5,       // fuel fraction that clears it (at a single-resource depot)
-    ammoFull: 0.6,       // ammo fraction that clears it (at a single-resource depot)
+    fuelFull: 0.5,       // fuel fraction that marks "fuel topped" (the resource a fuel depot fills)
+    ammoFull: 0.6,       // ammo fraction that marks "ammo topped" (the resource an ammo depot fills)
+    fuelOK: 0.25,        // fuel that's "enough to carry on" — the bar the OTHER resource must clear at a depot
+    ammoOK: 0.5,         // ammo that's "enough to carry on"
     topFull: 0.99,       // at an OWN BASE (heals too) don't leave until ammo, fuel AND hp are ALL maxed
   },
   // Latched interrupts: once tripped they hold (hysteresis) until their clear

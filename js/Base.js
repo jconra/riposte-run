@@ -3,7 +3,7 @@
 // registered with the shared DestructibleManager so it can be shot to rubble.
 
 import * as THREE from 'three';
-import { Destructible } from './Destructible.js';
+import { Destructible } from './Destructible.js?v=1';
 
 // Materials shared across all bases (cheap; built once).
 const STONE = new THREE.MeshStandardMaterial({ color: '#9a948a', roughness: 0.92, metalness: 0.0 });

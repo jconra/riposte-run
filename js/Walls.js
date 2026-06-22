@@ -5,7 +5,7 @@
 // and the corner gun are separately destructible.
 
 import * as THREE from 'three';
-import { Destructible } from './Destructible.js';
+import { Destructible } from './Destructible.js?v=1';
 import { makeFlagHQ, makeBarracks, makeDepot, makeElevator, makeAdmin, makeQuonset, makeTent } from './Buildings.js?v=2';
 import { concreteTexture, accentPlateTexture } from './BuildingTextures.js?v=2';
 

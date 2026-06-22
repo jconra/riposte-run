@@ -78,11 +78,18 @@ class Capture extends Mission {
     const f = cmd.flag();
     if (f && f.carrier === cmd.unit) return cmd.homePos();            // carrying → run it home
     const flagPt = f ? { x: f.group.position.x, z: f.group.position.z } : cmd.enemyBasePos();
-    if (cmd.archetype === 'rogue' && cmd.unit) {                       // stealth approach from the rear
-      const from = cmd.homePos(), base = cmd.enemyBasePos();
-      const baseFromHome = Math.hypot(base.x - from.x, base.z - from.z);
-      const u = cmd.unit.holder.position;
-      if (Math.hypot(u.x - from.x, u.z - from.z) < baseFromHome - 6) return cmd.enemyRearApproach();
+    if (cmd.archetype === 'rogue' && cmd.unit) {                       // stealth: loop to the rear, THEN grab
+      const u = cmd.unit.holder.position, rear = cmd.enemyRearApproach();
+      // Head for the rear staging point first, but LATCH the handoff to the flag once we
+      // reach the rear OR we're already on the doorstep — otherwise the two far-apart goals
+      // flip every tick and the runner just pivots in place outside the base (the spin bug).
+      // The latch lives on the unit, so a fresh runner re-does the loop; a carrier ignores it.
+      if (!cmd.unit._rearReached) {
+        const nearRear = Math.hypot(u.x - rear.x, u.z - rear.z) < 10;
+        const nearFlag = Math.hypot(u.x - flagPt.x, u.z - flagPt.z) < 22;
+        if (nearRear || nearFlag) cmd.unit._rearReached = true;
+        else return rear;
+      }
     }
     return flagPt;
   }
@@ -91,7 +98,8 @@ class Capture extends Mission {
   label(cmd) {
     const f = cmd.flag();
     if (f && f.carrier === cmd.unit) return 'home with the flag';
-    return cmd.archetype === 'rogue' ? 'sneaking in the back' : 'snatching the flag';
+    if (cmd.archetype === 'rogue' && !(cmd.unit && cmd.unit._rearReached)) return 'sneaking round the back';
+    return 'snatching the flag';
   }
 }
 
@@ -176,7 +184,7 @@ class Warrior extends Doctrine {
   get opening() { return 'attack'; }
   get roles() { return { scout: 'lurcher', attack: 'lurcher', siege: 'jotun', defend: 'lurcher', capture: 'firebrat' }; }
   choose(cmd) {
-    if (cmd.flagExposed() && cmd.fortDown()) return 'capture';
+    if (cmd.flagGrabbable()) return 'capture';
     if (cmd.kills >= 2 || cmd.enemyEliminated()) return 'siege';
     return 'attack';
   }
@@ -188,7 +196,10 @@ class Rogue extends Doctrine {
   get opening() { return 'siege'; }
   get roles() { return { scout: 'firebrat', attack: 'valkyrie', siege: 'valkyrie', defend: 'valkyrie', capture: 'firebrat' }; }
   choose(cmd) {
-    if (cmd.flagExposed()) return 'capture';   // a race — go the moment the flag shows
+    // Race in the instant it's safe — but only once the flag is exposed AND its turrets
+    // are down (a Valkyrie can crack the HQ from range while towers still stand; sending
+    // the Firebrat then just feeds it to the guns).
+    if (cmd.flagGrabbable()) return 'capture';
     return 'siege';
   }
 }
@@ -200,9 +211,8 @@ class Hunter extends Doctrine {
   get opening() { return 'scout'; }
   get roles() { return { scout: 'valkyrie', attack: 'lurcher', siege: 'valkyrie', defend: 'lurcher', capture: 'firebrat' }; }
   choose(cmd) {
-    if (cmd.flagExposed() && cmd.fortDown()) return 'capture';
+    if (cmd.flagGrabbable()) return 'capture';
     if (cmd.enemyEliminated()) return 'siege';                 // no one to hunt → press the base
-    if (cmd.kills >= 3 && cmd.flagExposed()) return 'capture';
     if (!cmd.knowsEnemy()) return 'scout';                     // haven't found them yet → recon
     return 'attack';
   }
@@ -214,7 +224,7 @@ class Turtle extends Doctrine {
   get opening() { return 'defend'; }
   get roles() { return { scout: 'lurcher', attack: 'lurcher', siege: 'valkyrie', defend: 'lurcher', capture: 'firebrat' }; }
   choose(cmd) {
-    if (cmd.flagExposed() && cmd.fortDown()) return 'capture';
+    if (cmd.flagGrabbable()) return 'capture';
     if (cmd.kills >= 2 || cmd.enemyEliminated()) return 'siege';
     return 'defend';
   }
