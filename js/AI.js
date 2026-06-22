@@ -19,7 +19,7 @@
 // `Brain.think()` is now a thin wrapper around runBrain(DEFAULT_BRAIN, …); assign a
 // different graph to a brain's `.graph` to change its behavior.
 
-import { COUNTER } from './AIStrategies.js?v=62';   // rock-paper-scissors web for fight-or-flight matchups
+import { COUNTER } from './AIStrategies.js?v=64';   // rock-paper-scissors web for fight-or-flight matchups
 
 const TYPES = ['lurcher', 'firebrat', 'valkyrie', 'jotun'];
 const CALLSIGNS = ['Viper', 'Rook', 'Ghost', 'Talon', 'Hammer', 'Wraith', 'Jackal',
@@ -273,9 +273,37 @@ const BEHAVIORS = {
         mem._wantMove = true;
         return { fwd, turn, fire, strafe: 0, state: mode };
       }
+      // BLOCKED LINE (shot-feedback): our last rounds kept detonating on the terrain/cover
+      // between us and the target instead of on the enemy. Grinding the same shot is the
+      // "two units fire at the hill between them forever" stalemate — so commit to a hard
+      // sidestep (held ~1.5s so it actually clears the hump) while still test-firing the new
+      // lane; the instant a shot connects the feedback resets and normal footwork resumes.
+      if (view.shotBlocked) {
+        if (mem._unblockT == null || (mem.t - mem._unblockT) > 1.5) {
+          mem._unblockDir = mem.rng() < 0.5 ? -1 : 1; mem._unblockT = mem.t;
+        }
+        mem._wantMove = true;
+        return { fwd: 0.35, turn, fire, strafe: mem._unblockDir * 0.95, state: mode };
+      }
+      // AMBUSH A JOTUN (ai_behavior Hunter): its 30° front arc is a guaranteed hit, so
+      // never trade there — if we're in front of a MOVING Jotun, let it roll by: hold fire,
+      // ease out of the kill zone, and orbit hard toward its blind rear. Once we're off its
+      // nose the normal press/strafe below takes over and we hit it from behind.
+      let holdOff = false;
+      if (view.enemy.type === 'jotun' && Math.hypot(view.enemy.vx || 0, view.enemy.vz || 0) > 1.5) {
+        const rel = wrapPi(Math.atan2(self.x - view.enemy.x, self.z - view.enemy.z)
+                         - Math.atan2(view.enemy.vx, view.enemy.vz));   // 0 = on its nose, ±π = behind it
+        if (Math.abs(rel) < 1.0) {
+          holdOff = true;
+          mem._strafeDir = rel >= 0 ? 1 : -1;            // orbit the short way to the rear
+          strafe = mem._strafeDir * Math.max(tac.strafe, 0.9);
+          fire = false;
+          if (dist < range * 0.9) fwd = -0.3;            // back out of the front arc
+        }
+      }
       // PRESS — we hold the edge (or they're running): close in, and CUT OFF a fleeing
       // target by steering at a point AHEAD of its travel instead of its current spot.
-      if (tac.press > 0 && (view.enemy.retreating || tac.press >= 0.7)) {
+      if (!holdOff && tac.press > 0 && (view.enemy.retreating || tac.press >= 0.7)) {
         if (dist > range * 0.5) fwd = 1;
         if (view.enemy.retreating) {
           const tx = view.enemy.x + (view.enemy.vx || 0) * 0.9, tz = view.enemy.z + (view.enemy.vz || 0) * 0.9;
@@ -283,9 +311,14 @@ const BEHAVIORS = {
         }
       }
       // STRAFE — orbit out of the kill arc; direction flips on a jittered timer (≈ the
-      // "switch directions to dodge the rocket" reflex).
-      if (tac.strafe > 0 && dist < range * 1.6) {
-        if (mem._strafeT == null || (mem.t - mem._strafeT) > (2.2 + mem.rng() * 2.2)) {
+      // "switch directions to dodge the rocket" reflex). Skipped while holding off a Jotun
+      // (that sets its own rear-ward orbit just above).
+      if (!holdOff && tac.strafe > 0 && dist < range * 1.6) {
+        // Juke far more often against a Valkyrie — frequent direction changes throw its
+        // homing rockets off (the doc's "switch directions when they fire" reflex, without
+        // needing to know the exact moment it shoots).
+        const flip = view.enemy.type === 'valkyrie' ? (1.0 + mem.rng() * 1.2) : (2.2 + mem.rng() * 2.2);
+        if (mem._strafeT == null || (mem.t - mem._strafeT) > flip) {
           mem._strafeDir = mem.rng() < 0.5 ? -1 : 1; mem._strafeT = mem.t;
         }
         strafe = mem._strafeDir * tac.strafe;

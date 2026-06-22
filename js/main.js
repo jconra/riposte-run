@@ -16,8 +16,8 @@ import { Garage, GARAGE_COUNTS } from './Garage.js?v=1';
 import { TEAM_COLORS, updateCamo, camoParams } from '../../vehicle-designer/js/CamoTexture.js';
 import { SoundManager } from '../../vehicle-designer/js/SoundManager.js';
 import { Projectiles } from '../../vehicle-designer/js/Projectiles.js';
-import { Brain, randomPersonality } from './AI.js?v=71';
-import { makeDoctrine, pickArchetype, assignArchetypes, COUNTER } from './AIStrategies.js?v=62';
+import { Brain, randomPersonality } from './AI.js?v=75';
+import { makeDoctrine, pickArchetype, assignArchetypes, COUNTER } from './AIStrategies.js?v=64';
 import { ExploreMemory } from './ExploreMemory.js?v=54';
 import { astarGrid } from './astar.js';
 import { makeFuelTank, makeAmmoDepot, makeShieldGenerator, makeShieldBubble, RESUPPLY_TINT } from './Resupply.js';
@@ -704,9 +704,15 @@ const FIRE_INTERVALS = [0.32, 0.11, 1.05, 1.7];   // by soundIndex: Lurcher, Fir
 const SHOT_DMG       = [35, 14, 90, 180];          // damage per hit
 const SHOT_BLAST     = [1.2, 0.6, 4.5, 5.5];       // splash radius (laser/tracer tiny, missile/rail big)
 // Effective projectile speed (u/s) for AI aim-leading, by soundIndex. Firebrat (1) is
-// hitscan and Jotun (3) has a charge delay — both 0 (no lead). The missile (2)
-// accelerates; ~32 is roughly its average speed over a typical flight.
-const PROJ_SPEED     = [85, 0, 32, 0];
+// hitscan (0 = no lead). The Jotun (3) slug is a real 115 u/s round — its complication
+// is the railgun CHARGE delay (below), not its speed. The missile (2) accelerates; ~32
+// is roughly its average speed over a typical flight.
+const PROJ_SPEED     = [85, 0, 32, 115];
+// Extra fixed delay (s) between the AI deciding to fire and the round actually leaving the
+// muzzle, by soundIndex — only the Jotun's railgun charges (setTimeout 900ms in fireVehicle).
+// leadAim folds this into the flight time so the slug is aimed where the target WILL be when
+// it finally discharges + flies there, not where it was when the gun started winding up.
+const CHARGE_DELAY   = [0, 0, 0, 0.9];
 // AI aim-leading strength: fraction of the predicted lead actually applied. Kept BELOW
 // 1 on purpose — a perfect intercept gives a fleeing target no way out; this leads
 // enough to connect on a straight runner but leaves room to juke (Jacob: "better, not
@@ -908,16 +914,19 @@ function leadAim(shooterPos, enemy, soundIndex, jitter = 0) {
   const sp = PROJ_SPEED[soundIndex] || 0;
   const vx = enemy.vx || 0, vz = enemy.vz || 0;
   if (sp <= 0 || (vx === 0 && vz === 0)) return _leadV.set(enemy.x, enemy.y, enemy.z);
-  let t = 0;
+  // Total time to impact = the gun's charge delay (Jotun railgun) + the round's flight time.
+  // Seed the solve with the charge so the first flight-distance estimate already looks ahead.
+  const charge = CHARGE_DELAY[soundIndex] || 0;
+  let t = charge;
   for (let i = 0; i < 4; i++) {
     const ex = enemy.x + vx * t, ez = enemy.z + vz * t;
-    t = Math.hypot(ex - shooterPos.x, ez - shooterPos.z) / sp;
+    t = charge + Math.hypot(ex - shooterPos.x, ez - shooterPos.z) / sp;
   }
   const lead = AIM_LEAD * (1 + (Math.random() - 0.5) * jitter);
   return _leadV.set(enemy.x + vx * t * lead, enemy.y, enemy.z + vz * t * lead);
 }
 
-function fireVehicle(veh, playSound, targetPoint = null, targetVeh = null) {
+function fireVehicle(veh, playSound, targetPoint = null, targetVeh = null, aimedAtEnemy = false) {
   if (!veh || veh.dead) return;
   if (veh.ammo <= 0) { if (veh.isPlayer) updatePlayerHud(); return; }   // dry — rearm at a depot/base
   veh.ammo -= 1;
@@ -958,6 +967,7 @@ function fireVehicle(veh, playSound, targetPoint = null, targetVeh = null) {
       const shot = projectiles.items[projectiles.items.length - 1];
       if (shot) {
         shot.dmg = SHOT_DMG[idx]; shot.blast = SHOT_BLAST[idx]; shot.team = veh.team; shot.shooter = veh;
+        shot.atVehicle = aimedAtEnemy;   // shot-feedback: was this round aimed at an enemy vehicle?
         // Home onto the locked target (live position) — but only if it's holdable;
         // a too-fast mover (red box) dumb-fires straight.
         if (guided && shot.setHoming && (lock.static || lock.locked)) {
@@ -1170,21 +1180,27 @@ function updateLock(dt) {
 }
 
 // Apply blast damage at a world point to walls/buildings, trees, and vehicles.
+// Returns true if the blast actually damaged an enemy vehicle (direct or splash) — the
+// caller uses this to tell a clean hit from a shot that detonated on terrain/cover.
 function explodeAt(point, blast, dmg, team, shooter) {
   destructibles.damageAt(point, blast, dmg);
   if (foliage) foliage.hitTreesAt(point, blast, dmg);
-  damageVehiclesAt(point, blast, dmg, team, shooter);
+  const tagged = damageVehiclesAt(point, blast, dmg, team, shooter);
   spawnImpact(point, blast);
+  return tagged;
 }
 
 // Damage enemy vehicles within blast of a point (never the shooter or its team).
+// Returns true if it hit at least one enemy vehicle.
 function damageVehiclesAt(point, blast, dmg, team, shooter) {
+  let hitAny = false;
   for (const v of combatants) {
     if (v.dead || v === shooter) continue;
     if (team != null && v.team === team) continue;
     const reach = blast + v.hitR;
-    if (v.holder.position.distanceToSquared(point) <= reach * reach) damageVehicle(v, dmg, 'vehicle', shooter);
+    if (v.holder.position.distanceToSquared(point) <= reach * reach) { damageVehicle(v, dmg, 'vehicle', shooter); hitAny = true; }
   }
+  return hitAny;
 }
 
 // Running tally of damage dealt to vehicles, by source — powers siege diagnostics
@@ -1300,7 +1316,16 @@ function updateProjectileHits() {
     const hitGround = pos.y <= map.heightAt(pos.x, pos.z) + 0.2 && map.isLand(pos.x, pos.z);
     if (hitSolid || hitTree || hitVeh || hitGround) {
       if (hitSolid) hitSolid.damage(p.dmg, pos);   // direct hit = full damage (splash adds a little more)
-      explodeAt(pos, p.blast, p.dmg, p.team, p.shooter);
+      const tagged = explodeAt(pos, p.blast, p.dmg, p.team, p.shooter);
+      // SHOT FEEDBACK: for a round AIMED at an enemy vehicle, tell a clean hit (it tagged
+      // someone, direct or splash) from one that detonated on terrain/cover short of the
+      // target. A run of blocked shots flags the shooter so its combat brain can sidestep
+      // to open a clear lane (the "two units shoot the hill between them forever" stalemate).
+      const sh = p.shooter;
+      if (p.atVehicle && sh && !sh.dead) {
+        if (tagged) { sh._blockedShots = 0; }
+        else { sh._blockedShots = (sh._blockedShots || 0) + 1; sh._lastBlockT = performance.now(); }
+      }
       projectiles.scene.remove(p.obj); p.dispose(); projectiles.items.splice(i, 1);
     }
   }
@@ -1919,6 +1944,19 @@ function nearestOpenCell(v, gi, gj, R) {
   return null;
 }
 // Plan a cell path from the unit to `dest`; returns world waypoints [{x,z}] or null.
+// Grid cells that contain a tree — the "forest" the Hunter likes to travel through. Built
+// once from the foliage scatter (rebuilt on a new match via page reload), looked up cheaply
+// in the A* cost. Stays null until foliage exists so we don't cache an empty set early.
+let forestCells = null;
+function forestHas(k) {
+  if (forestCells === null) {
+    if (!foliage || !foliage.trees) return false;
+    forestCells = new Set();
+    const fc = grid.cell;
+    for (const t of foliage.trees) forestCells.add(Math.round(t.x / fc) + ',' + Math.round(t.z / fc));
+  }
+  return forestCells.has(k);
+}
 function planPath(v, dest) {
   const c = grid.cell;
   const start = { i: Math.round(v.holder.position.x / c), j: Math.round(v.holder.position.z / c) };
@@ -1927,10 +1965,17 @@ function planPath(v, dest) {
   const iMax = Math.ceil(map.worldW / 2 / c) + 10, jMax = Math.ceil(map.worldH / 2 / c) + 10;
   const inBounds = (i, j) => i >= -iMax && i <= iMax && j >= -jMax && j <= jMax;
   const roads = roadNet.cells;
+  const arch = v._archetype;
+  const onRoad = (i, j) => roads && (roads.has(i + ',' + j) || gateCells.has(i + ',' + j));
+  // Personality terrain preference (ai_behavior): each commander has its OWN cheap highway.
+  // Warrior (and the player/default) uses ROADS; the Rogue sneaks over OCEAN; the Hunter
+  // moves under FOREST cover. The preference only bites for units that can traverse it —
+  // cellBlocked already bars sinkers from deep water and light units from trees.
   const cost = (i, j) => {
     if (cellBlocked(v, i, j)) return Infinity;
-    const k = i + ',' + j;
-    return (roads && roads.has(k)) || gateCells.has(k) ? 0.5 : 1;   // roads + gate centre are the cheap lane
+    if (arch === 'rogue') return !map.isLand(i * c, j * c) ? 0.45 : (onRoad(i, j) ? 0.8 : 1);
+    if (arch === 'hunter') return forestHas(i + ',' + j) ? 0.45 : (onRoad(i, j) ? 0.8 : 1);
+    return onRoad(i, j) ? 0.5 : 1;   // Warrior + default: roads are the cheap lane
   };
   const path = astarGrid({ start, goal, cost, inBounds, turnPenalty: 3 });
   if (!path || path.length < 2) return null;
@@ -2078,24 +2123,23 @@ class AICommander {
     const FWD = 18, SIDE = 26;                                      // forward a touch, well to the side, still in tower range
     return { x: base.x + dx * FWD + px * SIDE * side, z: base.z + dz * FWD + pz * SIDE * side };
   }
-  // A patrol LOOP around our flag base so a defending Turtle paces its perimeter
-  // instead of parking on one ambush spot. Points sit across the enemy-facing edge
-  // (in tower cover) plus a sweep behind; the index advances as the unit nears the
-  // current waypoint, so it never settles. The brain still drops into engage the
-  // moment it spots an attacker — this only fills the idle "nothing in sight" time.
+  // A patrol that sweeps the CORRIDOR between our two bases — the flag HQ (rear) and the
+  // elevator (forward) — so a defending Turtle covers everything it has to protect instead
+  // of pacing one base (the old loop huddled on the flag HQ, which read as too passive).
+  // Each waypoint is nudged toward the threat so the route hugs the enemy-facing side of
+  // the corridor (where an attacker comes from), still on home ground in tower cover. The
+  // index advances as the unit nears its waypoint, oscillating flag↔mid↔elevator↔mid, so it
+  // never settles. The brain still drops into engage the instant it spots an attacker —
+  // this only fills the idle "nothing in sight" time.
   patrolSpot() {
-    const base = this.homeBasePos(), enemy = this.enemyBasePos();
-    let dx = enemy.x - base.x, dz = enemy.z - base.z;
-    const d = Math.hypot(dx, dz) || 1; dx /= d; dz /= d;            // toward the threat
-    const px = -dz, pz = dx;                                        // perpendicular = "to the side"
+    const flag = this.homeBasePos(), fob = this.homePos(), enemy = this.enemyBasePos();
     if (!this._patrol) {
-      const FWD = 16, SIDE = 24;
-      this._patrol = [
-        { x: base.x + dx * FWD + px * SIDE,        z: base.z + dz * FWD + pz * SIDE        }, // forward, one flank
-        { x: base.x + dx * (FWD + 8),              z: base.z + dz * (FWD + 8)              }, // forward, centre (toward threat)
-        { x: base.x + dx * FWD - px * SIDE,        z: base.z + dz * FWD - pz * SIDE        }, // forward, other flank
-        { x: base.x - dx * 4 - px * SIDE * 0.7,    z: base.z - dz * 4 - pz * SIDE * 0.7    }, // sweep back across the base
-      ];
+      const mid = { x: (flag.x + fob.x) / 2, z: (flag.z + fob.z) / 2 };
+      let tx = enemy.x - mid.x, tz = enemy.z - mid.z;
+      const td = Math.hypot(tx, tz) || 1; tx /= td; tz /= td;       // unit vector toward the threat
+      const NUDGE = 16;                                             // lean the route toward the enemy-facing edge
+      const at = (b) => ({ x: b.x + tx * NUDGE, z: b.z + tz * NUDGE });
+      this._patrol = [ at(flag), at(mid), at(fob), at(mid) ];       // flag → mid → elevator → mid → …
       this._patrolI = 0;
     }
     const wp = this._patrol[this._patrolI];
@@ -2143,6 +2187,15 @@ class AICommander {
   // runner can't grab it before then, so the heavy must finish the HQ first —
   // strategy cards gate the open→grab handoff on this.
   flagExposed() { const f = this.flag(); return !!(f && f.revealed); }
+  // A staging point on the FAR (back) side of the enemy flag base — past its centre,
+  // away from the lane our units approach on. A Rogue runner curls around to here to slip
+  // in the BACK instead of the hot front (ai_behavior Capture).
+  enemyRearApproach() {
+    const base = this.enemyBasePos(), from = this.homePos();
+    let dx = base.x - from.x, dz = base.z - from.z;
+    const d = Math.hypot(dx, dz) || 1; dx /= d; dz /= d;
+    return { x: base.x + dx * 30, z: base.z + dz * 30 };
+  }
   // A point just outside the enemy base's lowest-HP wall — where to punch through.
   weakestApproach() {
     const tt = this.targetTeam(), base = this.enemyBasePos();
@@ -2170,18 +2223,30 @@ class AICommander {
   // The type to actually field: the wanted one if any remain, else a same-class
   // substitute, else whatever we have most of, else null (roster empty → eliminated).
   _pickAvailableType(want) {
-    if ((this.roster[want] || 0) > 0) return want;
+    const have = t => this.roster[t] || 0;
     // Substitute by ROLE, not raw speed. The Valkyrie is a base-ATTACKER (like the
     // heavies); the Firebrat is the fragile flag RUNNER. The old by-speed grouping fell a
     // dead-Valkyrie siege role back to a Firebrat (both "fast") and shoved a paper-thin
     // runner into a tower duel — it got shredded. A wanted SIEGER substitutes another
     // sieger (Jotun first, then Lurcher); a wanted runner has no real stand-in.
     const pool = want === 'firebrat' ? [] : ['jotun', 'lurcher', 'valkyrie'];
-    const sub = pool.filter(t => t !== want && (this.roster[t] || 0) > 0);
+    // SAVE THE LAST OF A TYPE: don't burn a type's FINAL vehicle while another type still
+    // has 2+ to spare — hold each type's last unit in reserve for the endgame. So a brain
+    // that wants a type it's down to one of (or out of) fields an abundant same-role
+    // substitute first. (Firebrats are the only runner, so they have no stand-in and skip
+    // this — the Hunter's own firebrat reserve handles saving those for the capture.)
+    if (have(want) >= 2) return want;                      // plenty of the wanted type — use it
+    const richSub = pool.filter(t => t !== want && have(t) >= 2);
+    if (richSub.length) { richSub.sort((a, b) => have(b) - have(a)); return richSub[0]; }
+    // Nothing abundant left to spare — everything's down to its last, so it's now fine to
+    // spend a final unit: the wanted type if any remain, else a same-role sub, else
+    // whatever we have most of (e.g. a firebrat-only fleet).
+    if (have(want) > 0) return want;
+    const sub = pool.filter(t => t !== want && have(t) > 0);
     if (sub.length) return sub[0];
-    const any = Object.keys(this.roster).filter(t => (this.roster[t] || 0) > 0);
+    const any = Object.keys(this.roster).filter(t => have(t) > 0);
     if (!any.length) return null;
-    any.sort((a, b) => this.roster[b] - this.roster[a]);   // last resort (e.g. a firebrat-only fleet) — most numerous
+    any.sort((a, b) => have(b) - have(a));   // last resort (e.g. a firebrat-only fleet) — most numerous
     return any[0];
   }
   // A recon waypoint into unexplored map, held until the unit reaches it, then advanced
@@ -2224,6 +2289,7 @@ class AICommander {
     scene.add(v.group);
     initCombatant(v, this.team, this.colorIndex, false);
     v.ai = new Brain(this.personality);
+    v._archetype = this.archetype;   // drives the nav terrain preference (Rogue ocean / Hunter forest)
     this.unit = v;
     // Ride up the FOB elevator like the player does — it can't leave (or shoot)
     // until the lift tops out, so neither side gets a head start (see update()).
@@ -2392,9 +2458,12 @@ class AICommander {
   _maybeRecall() {
     if (!this.unit || this._recalling) return;
     if (this.strategy.step === this._stepAtDeploy) return;          // same beat → keep the current unit
-    const want = this.strategy.wantVehicle(this);
+    // Compare against the type we'd ACTUALLY field (after save-last / role substitution),
+    // not the raw role want — otherwise a unit that's already the best available substitute
+    // gets recalled to "swap" for a wanted type we'd only re-substitute right back to it.
+    const want = this._pickAvailableType(this.strategy.wantVehicle(this));
     this._stepAtDeploy = this.strategy.step;                        // consume the step change either way
-    if (this.unit.type === want) return;                           // new beat wants the same vehicle → carry on
+    if (!want || this.unit.type === want) return;                  // new beat wants the same vehicle → carry on
     this._recalling = true; this._recallT = 22;                    // backstop: give up the trip after 22s
     this._nav.path = null;                                          // replan toward home
     aiLog(this.team, `${this.cname} pulls ${this.unit.type} home to swap for ${want}`);
@@ -2494,15 +2563,15 @@ class AICommander {
     // unit aims LOW instead — at the obstruction — so the shell demolishes a path through
     // rather than arcing uselessly over the wall at a turret it can't reach.
     if (cmd.fire && v.cooldown <= 0) {
-      let tp = null;
+      let tp = null, atEnemy = false;
       if (cmd.state === 'suppress' && view.threat) {
         tp = (!view.threatLOS && view.demolishTarget)
           ? _aimDir.set(view.demolishTarget.x, view.demolishTarget.y, view.demolishTarget.z).clone()
           : _aimDir.set(view.threat.x, view.threat.y, view.threat.z).clone();
       }
-      else if (view.enemy) tp = leadAim(v.holder.position, view.enemy, v.def.soundIndex, v.ai.p.jitter).clone();   // lead a moving target (Lurcher/Valkyrie)
+      else if (view.enemy) { tp = leadAim(v.holder.position, view.enemy, v.def.soundIndex, v.ai.p.jitter).clone(); atEnemy = true; }   // lead a moving target (Lurcher/Valkyrie/Jotun; charge-compensated for the railgun)
       else if (cmd.breakAim) tp = _aimDir.set(cmd.breakAim.x, cmd.breakAim.y, cmd.breakAim.z).clone();   // blasting a blocker out of the way
-      fireVehicle(v, false, tp);
+      fireVehicle(v, false, tp, null, atEnemy);
     }
   }
 
@@ -2527,11 +2596,15 @@ class AICommander {
     // DISCOVER nearby supply points — the team only "knows" a depot once one of its
     // units has come within sight of it (LOS for ground units; flyers see over walls).
     // Discoveries are remembered on the commander, so the team keeps the intel even
-    // after this unit dies and a new one deploys.
+    // after this unit dies and a new one deploys. The shield generator is a TALL glowing
+    // beacon, so it's spotted from much further off than a low fuel/ammo crate — a unit
+    // out on the field sees it across the map (still needs LOS, so it's earned, not given).
+    // That's what makes the flank generator actually get discovered + used.
     for (const rp of resupplies) {
       if (rp.dead || this.knownSupplies.has(rp)) continue;
+      const sight = rp.kind === 'shield' ? AI_VISION * 2.6 : AI_VISION;
       const d2 = (rp.pos.x - px) ** 2 + (rp.pos.z - pz) ** 2;
-      if (d2 < AI_VISION * AI_VISION && (flyer || hasLOS(px, pz, rp.pos.x, rp.pos.z))) this.knownSupplies.add(rp);
+      if (d2 < sight * sight && (flyer || hasLOS(px, pz, rp.pos.x, rp.pos.z))) this.knownSupplies.add(rp);
     }
     let goal = this.strategy.objective(this);
     // DEFEND override (ai_behavior): if a rival is running off with OUR flag, abandon the
@@ -2550,7 +2623,12 @@ class AICommander {
         && v.maxShield > 0 && v.shield < v.maxShield * 0.6
         && !(this.flag() && this.flag().carrier === v)) {
       const gen = this.nearestKnownShield(px, pz);
-      if (gen && Math.hypot(gen.pos.x - px, gen.pos.z - pz) < SHIELD_GRAB_RANGE) {
+      // Detour distance scales with how EMPTY the shield is: a fresh unit (0 armour) will
+      // go well out of its way to top up (×1.6), one already half-full barely diverts (×1).
+      // So armour-capable units reliably swing by the generator on the way out, instead of
+      // only grabbing it when it happens to be right next to them.
+      const reach = SHIELD_GRAB_RANGE * (1.6 - v.shield / v.maxShield);
+      if (gen && Math.hypot(gen.pos.x - px, gen.pos.z - pz) < reach) {
         goal = { x: gen.pos.x, z: gen.pos.z }; this._shielding = true;
       }
     }
@@ -2680,6 +2758,9 @@ class AICommander {
       dt,
       self: { x: px, z: pz, heading: h, type: v.type, shield: v.shield, hpFrac: v.hp / v.maxHp, fuelFrac: v.fuel / v.maxFuel, ammoFrac: v.ammo / v.maxAmmo },
       seesEnemy, enemy, flyer, shotArc: SHOT_ARC[v.type] ?? Math.PI / 5,
+      // shot-feedback: ≥2 of our recent rounds (last ~2s) detonated on terrain/cover, not on
+      // the enemy → the firing lane is blocked; the combat brain sidesteps to clear it.
+      shotBlocked: (v._blockedShots || 0) >= 2 && (performance.now() - (v._lastBlockT || 0)) < 2000,
       enemyGone: this.enemyEliminated(),   // target fleet wiped → don't waste time ghost-chasing a dead sighting
       support: turretCountOf(this.team) > 0 ? this.homeBasePos() : null,   // rally toward own tower cover (ai_behavior duels)
       threat, threatLOS, flankSide, threatStand, demolishTarget, breakTarget, engageRange: ENGAGE_RANGE[v.type] || 36,
@@ -3016,6 +3097,16 @@ function buildObstacles() {
     }
     obstacles.push({ x: w.group.position.x, z: w.group.position.z, team: c.team, body: w.body,
                      r: w.type === 'CORNER' ? grid.cell * 0.7 : grid.cell * 0.5 });
+  }
+  // The flag HQ is a SOLID building, not a drive-through. Add it as an obstacle so vehicles
+  // STOP at it (and a sieger nosed against it shoots it down — that's the breach path that
+  // actually cracks the HQ + exposes the flag) and A* routes around it instead of plowing
+  // through. The surrounding ring is road (handled first in blockedFor/cellBlocked) so the
+  // approach lanes stay open; once the HQ is rubble the dead-body skip below lets the flag
+  // runner roll over the wreck to the flag. Radius ≈ the cell*1.7 footprint half.
+  for (const c of camps) {
+    if (!c.flagHQ || c.flagHQ.dead) continue;
+    obstacles.push({ x: c.center.x, z: c.center.z, team: c.team, body: c.flagHQ, r: grid.cell * 0.85 });
   }
   // Soft world edge: a ring ~70u beyond the outermost base. Keeps flyers (which
   // cross water) from wandering off the island into open ocean / the void. Land
@@ -3775,7 +3866,7 @@ window.RR = {
   tickFlags: (dt = 0.1) => updateFlags(dt),
   tickResupply: (dt = 0.1) => updateResupplies(dt),
   fireUnit: (v) => fireVehicle(v, false),
-  fireAtWorld: (x, y, z, v) => fireVehicle(v || player, false, new THREE.Vector3(x, y, z)),
+  fireAtWorld: (x, y, z, v, atEnemy = false) => fireVehicle(v || player, false, new THREE.Vector3(x, y, z), null, atEnemy),
   tickLock: (dt = 0.1) => updateLock(dt),
   lockOnVehicle: (v) => setLock(v, null),
   lockPoint: (x, y, z) => setLock(null, new THREE.Vector3(x, y, z)),
@@ -3811,6 +3902,8 @@ window.RR = {
   get spectateFocus() { return spectateTarget; },
   aiView: (i = 0) => { const c = commanders[i]; return c && c.unit ? c._view(c.unit, 0.1) : null; },
   aiKnownSupplyCount: (i = 0) => { const c = commanders[i]; return c ? c.knownSupplies.size : null; },
+  // Headless targeting hook: where would the AI aim to lead this moving enemy? (jitter 0 → deterministic)
+  leadAim: (sx, sy, sz, ex, ez, vx, vz, soundIndex) => { const p = leadAim({ x: sx, y: sy, z: sz }, { x: ex, y: 0, z: ez, vx, vz }, soundIndex, 0); return { x: p.x, y: p.y, z: p.z }; },
   returnToGarage: () => returnToGarage(),
   get flagsCaptured() { return flagsCaptured; },
   tickTurrets: (dt = 0.1) => updateWallTurrets(dt),

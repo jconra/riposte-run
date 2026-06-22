@@ -68,14 +68,31 @@ class Siege extends Mission {
   label(cmd) { return 'the enemy base'; }
 }
 
-// CAPTURE — run a Firebrat for the flag; do NOT engage (the runner flees contact).
+// CAPTURE — run a Firebrat for the flag; do NOT engage (the runner flees contact). A Rogue
+// sneaks in the BACK: it curls around to a staging point behind the base while it's still
+// in front, then dives for the flag (the firebrat shoots a hole in any wall in its way).
 class Capture extends Mission {
   get key() { return 'capture'; }
   wantVehicle(cmd) { return 'firebrat'; }
-  objective(cmd) { return this._flagOrHome(cmd); }
+  objective(cmd) {
+    const f = cmd.flag();
+    if (f && f.carrier === cmd.unit) return cmd.homePos();            // carrying → run it home
+    const flagPt = f ? { x: f.group.position.x, z: f.group.position.z } : cmd.enemyBasePos();
+    if (cmd.archetype === 'rogue' && cmd.unit) {                       // stealth approach from the rear
+      const from = cmd.homePos(), base = cmd.enemyBasePos();
+      const baseFromHome = Math.hypot(base.x - from.x, base.z - from.z);
+      const u = cmd.unit.holder.position;
+      if (Math.hypot(u.x - from.x, u.z - from.z) < baseFromHome - 6) return cmd.enemyRearApproach();
+    }
+    return flagPt;
+  }
   shoot(cmd) { return false; }
   arriveDist(cmd) { return 3; }
-  label(cmd) { const f = cmd.flag(); return (f && f.carrier === cmd.unit) ? 'home with the flag' : 'snatching the flag'; }
+  label(cmd) {
+    const f = cmd.flag();
+    if (f && f.carrier === cmd.unit) return 'home with the flag';
+    return cmd.archetype === 'rogue' ? 'sneaking in the back' : 'snatching the flag';
+  }
 }
 
 // DEFEND — hold the home base under tower cover; the brain still engages on sight. Once
@@ -86,7 +103,7 @@ class Defend extends Mission {
   objective(cmd) { return cmd.patrolSpot(); }
   shoot(cmd) { return false; }
   arriveDist(cmd) { return 8; }
-  label(cmd) { return 'holding the flank (ambush)'; }
+  label(cmd) { return 'patrolling the rear (flag↔elevator)'; }
 }
 
 // INTERCEPT — our flag's been lifted: only a Valkyrie is mobile enough to run the thief
