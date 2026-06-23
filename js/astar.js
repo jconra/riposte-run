@@ -4,8 +4,11 @@
 // when forced).
 
 // opts: { start:{i,j}, goal:{i,j}, cost(i,j)->number|Infinity,
-//         inBounds(i,j)->bool, turnPenalty }. Returns [{i,j}...] or null.
-export function astarGrid({ start, goal, cost, inBounds, turnPenalty = 4, allowDiagonal = false }) {
+//         inBounds(i,j)->bool, turnPenalty, onStep }. Returns [{i,j}...] or null.
+// onStep (optional) is a visualizer hook: it fires once per node popped off the
+// heap, with { cur:{i,j}, open:[{i,j}...] (the live frontier), path:[{i,j}...]
+// (best route to cur so far) }. It's guarded so normal pathfinding pays nothing.
+export function astarGrid({ start, goal, cost, inBounds, turnPenalty = 4, allowDiagonal = false, onStep = null }) {
   // Default is 4-connected (orthogonal) — road LAYOUT needs clean right-angle, connected
   // grids. allowDiagonal adds the 4 diagonals so UNIT NAV can cut straight across open
   // ground instead of staircasing. A diagonal step travels √2 as far, so it costs √2× the
@@ -40,6 +43,14 @@ export function astarGrid({ start, goal, cost, inBounds, turnPenalty = 4, allowD
     const cur = pop();
     const curK = key(cur.i, cur.j, cur.d);
     if (cur.g > (g.get(curK) ?? Infinity)) continue;
+    if (onStep) {
+      // Reconstruct the best-known route to the node we just settled, so the
+      // visualizer can draw the path firming up as the frontier sweeps outward.
+      const pth = []; let node = cur;
+      while (node) { pth.push({ i: node.i, j: node.j }); node = from.get(key(node.i, node.j, node.d)) || null; }
+      pth.reverse();
+      onStep({ cur: { i: cur.i, j: cur.j }, open: heap.map(n => ({ i: n.i, j: n.j })), path: pth });
+    }
     if (cur.i === goal.i && cur.j === goal.j) {
       const path = [];
       let node = cur;

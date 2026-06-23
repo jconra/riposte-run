@@ -5,7 +5,7 @@
 // keeps it on land and bridges only when forced).
 
 import * as THREE from 'three';
-import { astarGrid } from './astar.js?v=3';
+import { astarGrid } from './astar.js?v=4';
 import { TILE } from './IslandMap.js';
 
 const ROAD_T = 0.5;   // road slab thickness — buried in the flat land, its side covers the drop at rough shore cells

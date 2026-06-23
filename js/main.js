@@ -19,7 +19,8 @@ import { Projectiles } from './Projectiles.js';
 import { Brain, randomPersonality } from './AI.js?v=80';
 import { makeDoctrine, pickArchetype, assignArchetypes, COUNTER } from './AIStrategies.js?v=66';
 import { ExploreMemory } from './ExploreMemory.js?v=54';
-import { astarGrid } from './astar.js?v=3';
+import { astarGrid } from './astar.js?v=4';
+import { AstarViz } from './AstarViz.js?v=3';
 import { makeFuelTank, makeAmmoDepot, makeShieldGenerator, makeShieldBubble, RESUPPLY_TINT } from './Resupply.js';
 
 // --- Renderer ----------------------------------------------------------
@@ -243,7 +244,10 @@ function updateCamera() {
 // For now this slides the camera target across the map. Once vehicles exist,
 // WASD will drive the vehicle and the camera will track it the same way.
 const keys = {};
-window.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; });   // firing is on the LEFT mouse / tap, not SPACE
+window.addEventListener('keydown', e => {
+  keys[e.key.toLowerCase()] = true;   // firing is on the LEFT mouse / tap, not SPACE
+  if (e.key.toLowerCase() === 'v' && !e.repeat) toggleAstarViz();   // A* search visualizer overlay
+});
 window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 
 function panUpdate(dt) {
@@ -2156,6 +2160,58 @@ function planPath(v, dest) {
   if (!path || path.length < 2) return null;
   return path.map(n => ({ x: n.i * c, z: n.j * c }));
 }
+
+// --- A* search visualizer (debug overlay) ------------------------------------
+// Toggle with the `v` key (or RR.astar()). It records the real A* search and lets
+// you step/scrub through the frontier expansion. buildGrid(name) hands the viz the
+// SAME cost field the game uses, so what you watch is exactly what units/roads see.
+let _astarViz = null;
+function buildAstarGrid(name) {
+  const c = grid.cell;
+  if (name === 'road layout') {
+    const iMax = Math.floor(map.worldW / 2 / c), jMax = Math.floor(map.worldH / 2 / c);
+    return {
+      cost: (i, j) => roadNet._cost(i, j),
+      inBounds: (i, j) => roadNet._inBounds(i, j),
+      bounds: { iMin: -iMax, iMax, jMin: -jMax, jMax },
+      allowDiagonal: false, turnPenalty: 6,
+    };
+  }
+  // unit nav: reproduce planPath's cost for a representative live vehicle.
+  const rep = player || combatants[0] ||
+    { _move: { water: 'sink', ignoreWalls: false, tree: 'bump' }, _archetype: 'warrior' };
+  const arch = rep._archetype || 'warrior';
+  const roads = roadNet.cells;
+  const onRoad = (i, j) => roads && (roads.has(i + ',' + j) || gateCells.has(i + ',' + j));
+  const cost = (i, j) => {
+    if (cellBlocked(rep, i, j)) return Infinity;
+    if (arch === 'rogue') return !map.isLand(i * c, j * c) ? 0.45 : (onRoad(i, j) ? 0.8 : 1);
+    if (arch === 'hunter') return forestHas(i + ',' + j) ? 0.45 : (onRoad(i, j) ? 0.8 : 1);
+    return onRoad(i, j) ? 0.5 : 1;
+  };
+  const iMax = Math.ceil(map.worldW / 2 / c) + 2, jMax = Math.ceil(map.worldH / 2 / c) + 2;
+  return { cost, inBounds: (i, j) => i >= -iMax && i <= iMax && j >= -jMax && j <= jMax,
+    bounds: { iMin: -iMax, iMax, jMin: -jMax, jMax }, allowDiagonal: true, turnPenalty: 3 };
+}
+// Hover height for the overlay plane: just above the tallest terrain in the grid
+// (coarse sample) so the sheet floats over the island, bases poking through.
+function astarHoverY() {
+  const c = grid.cell, iMax = Math.ceil(map.worldW / 2 / c), jMax = Math.ceil(map.worldH / 2 / c);
+  let mx = -Infinity;
+  for (let i = -iMax; i <= iMax; i += 4) for (let j = -jMax; j <= jMax; j += 4) {
+    const h = map.heightAt(i * c, j * c); if (isFinite(h) && h > mx) mx = h;
+  }
+  return (isFinite(mx) ? mx : 0) + 8;
+}
+function toggleAstarViz() {
+  if (!_astarViz) _astarViz = new AstarViz();
+  if (_astarViz.isOpen) { _astarViz.close(); paused = false; return; }   // resume the sim
+  _astarViz.open({
+    buildGrid: buildAstarGrid, gridNames: ['unit nav', 'road layout'], defaultGrid: 'unit nav',
+    three: THREE, scene, camera, domElement: renderer.domElement, cell: grid.cell, hoverY: astarHoverY(),
+  });
+  paused = true;   // freeze the sim while inspecting paths, like the full-screen log
+}
 // Stuck-escalation: after this many seconds genuinely stuck, a unit marks the spot it's
 // grinding impassable (avoidCell) and replans AROUND it, instead of repeating forever.
 const NAV_BLOCK_AFTER = 6.0;        // seconds stuck before we blacklist the trouble spot + replan
@@ -3208,6 +3264,7 @@ function setLogMode(mode) {
   aiLogMode = mode;
   paused = (mode === 'full');
   updateLogToggle();
+  updateAstarToggle();
   updateAiLog();
 }
 function ensureLogStyle() {
@@ -3801,7 +3858,8 @@ function setFieldUI(show) {
   // Touch controls: two fixed sticks — RIGHT is the directional NAV pad ("go this way"),
   // LEFT aims+fires within the vehicle's arc with aim-assist. The old corner FIRE buttons +
   // field point-to-steer are retired (firing-by-cursor was unreliable; thumb angles too hard).
-  const onTouch = show && touchUsed;
+  // Only when a human actually drives — in AI-vs-AI / spectate the sticks do nothing.
+  const onTouch = show && touchUsed && TEAM_CTRL[PLAYER_TEAM] === 'human';
   document.getElementById('touch-joystick')?.classList.toggle('visible', onTouch);
   document.getElementById('touch-aim')?.classList.toggle('visible', onTouch);
   for (const id of ['fire-btn', 'fire-btn-l']) {
@@ -3809,6 +3867,7 @@ function setFieldUI(show) {
   }
   if (show) refreshAimArc();   // tint the aim wedge to the deployed vehicle's arc
   ensureLogToggle(); updateLogToggle();   // phone-friendly AI-log button (top-right)
+  ensureAstarToggle(); updateAstarToggle();   // PATH button (left of LOG) — opens the A* visualizer
   if (!show) { fireHeld = false; touchAim = null; touchAiming = false; }   // drop a held shot at the garage
 }
 // Top-right LOG button (where the old map ⚙ sat) — reveals the log from hidden. It
@@ -3828,6 +3887,25 @@ function ensureLogToggle() {
 }
 function updateLogToggle() {
   const b = document.getElementById('ailog-toggle');
+  if (b) b.style.display = (onField && aiLogMode === 'hidden') ? 'block' : 'none';
+}
+// PATH button — sits just left of LOG (phones have no keyboard, so the `v` hotkey
+// is useless on mobile). Opens the A* search visualizer. Same visibility rule as
+// LOG so it never collides with the brief log box.
+function ensureAstarToggle() {
+  let b = document.getElementById('astar-toggle');
+  if (b) return b;
+  b = document.createElement('div'); b.id = 'astar-toggle'; b.textContent = 'PATH';
+  b.style.cssText = 'position:fixed;top:12px;right:76px;z-index:151;padding:7px 12px;border-radius:7px;' +
+    'font-family:"Courier New",monospace;font-weight:bold;font-size:13px;letter-spacing:2px;color:#dfe8ef;' +
+    'background:rgba(8,12,18,0.7);border:1px solid rgba(255,255,255,0.3);box-shadow:0 2px 8px rgba(0,0,0,0.3);' +
+    'user-select:none;-webkit-user-select:none;touch-action:manipulation;cursor:pointer;';
+  b.addEventListener('pointerdown', e => { e.preventDefault(); e.stopPropagation(); toggleAstarViz(); });
+  document.body.appendChild(b);
+  return b;
+}
+function updateAstarToggle() {
+  const b = document.getElementById('astar-toggle');
   if (b) b.style.display = (onField && aiLogMode === 'hidden') ? 'block' : 'none';
 }
 
@@ -4277,6 +4355,11 @@ window.RR = {
   bridgeDeckY: (x, z) => roadDeckY(x, z),                     // alias (kept for older verification scripts)
   navPlan: (v, x, z) => planPath(v, { x, z }),                 // debug: A* path for a unit
   navCellBlocked: (v, i, j) => cellBlocked(v, i, j),          // debug: nav passability of a cell
+  astar: () => toggleAstarViz(),                              // open/close the A* search visualizer overlay
+  get paused() { return paused; },                            // debug: is the sim frozen (full log or A* viz open)
+
+  get astarViz() { if (!_astarViz) _astarViz = new AstarViz(); return _astarViz; },   // debug: the viz instance
+  astarBuildGrid: (name) => buildAstarGrid(name),            // debug: the cost/inBounds/bounds for a grid
   avoidCell: (x, z) => avoidCell(x, z),                       // debug: blacklist a cell (stuck-escalation)
   get gateCells() { return [...gateCells]; },
   get gateSideCells() { return [...gateSideCells]; },
