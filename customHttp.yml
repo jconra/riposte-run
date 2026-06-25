@@ -1,0 +1,8 @@
+customHeaders:
+  # Allow the standalone designers (asset-designer.rmrfbase.com, map-designer.rmrfbase.com,
+  # localhost during dev) to import the game's ES modules cross-origin. These are public,
+  # non-credentialed static scripts, so a wildcard origin is safe.
+  - pattern: '**/*.js'
+    headers:
+      - key: 'Access-Control-Allow-Origin'
+        value: '*'
