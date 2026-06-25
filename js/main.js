@@ -4029,6 +4029,23 @@ function ensureMenuStyle() {
       box-shadow:0 2px 10px rgba(0,0,0,0.4); transition:background .12s, transform .06s; }
     #gamemenu button:hover { background:rgba(40,58,80,0.96); }
     #gamemenu button:active { transform:scale(0.97); }
+    #gamemenu .gm-group { display:flex; flex-direction:column; align-items:center; gap:12px; }
+    /* CAMPAIGN — present but not playable yet */
+    #gamemenu .gm-soon { position:relative; opacity:0.5; cursor:default; }
+    #gamemenu .gm-soon:hover { background:rgba(20,30,42,0.88); }
+    #gamemenu .gm-badge { position:absolute; top:-9px; right:-10px; background:#caa64a; color:#1a1208;
+      font-size:8px; font-weight:bold; letter-spacing:1px; padding:2px 7px; border-radius:10px;
+      transform:rotate(6deg); box-shadow:0 1px 4px rgba(0,0,0,0.5); }
+    /* DEV TOOLS submenu */
+    #gamemenu .gm-devhdr { color:#7fe7a3; font-size:13px; letter-spacing:6px; font-weight:bold;
+      margin-bottom:2px; text-shadow:0 0 8px rgba(80,255,150,0.35); }
+    #gamemenu .gm-toollbl { color:#5f7a6b; font-size:9px; letter-spacing:4px; margin:8px 0 -2px; }
+    #gamemenu a.gm-tool { width:262px; padding:13px 0; font-family:inherit; font-size:13px; letter-spacing:2px;
+      font-weight:bold; color:#9fc7e0; text-align:center; text-decoration:none; box-sizing:border-box;
+      background:rgba(14,22,32,0.88); border:1px solid rgba(120,180,220,0.28); border-radius:6px;
+      box-shadow:0 2px 10px rgba(0,0,0,0.4); transition:background .12s, transform .06s; }
+    #gamemenu a.gm-tool:hover { background:rgba(28,44,62,0.96); }
+    #gamemenu a.gm-tool:active { transform:scale(0.97); }
     #gamemenu .gm-help { width:min(86vw,340px); color:#aebecd; font-size:11px; line-height:1.6; letter-spacing:0.5px;
       background:rgba(8,12,18,0.72); border:1px solid rgba(255,255,255,0.15); border-radius:6px;
       padding:12px 16px; white-space:normal; text-align:left; margin-top:6px;
@@ -4051,8 +4068,21 @@ function ensureGameMenu() {
     '<div class="gm-title" id="gm-title">RMRF</div>' +
     '<div class="gm-cmd"><span class="pr">$</span> rm <span class="fl">-rf</span> /their/base | grep flag<span class="ct">&#9608;</span></div>' +
     '<div class="gm-sub" id="gm-sub">ISLAND CTF</div>' +
-    '<button data-act="pva">PLAYER VS AI</button>' +
-    '<button data-act="ava">AI VS AI</button>' +
+    '<div class="gm-group" id="gm-main">' +
+      '<button data-act="pva">PLAYER VS AI</button>' +
+      '<button class="gm-soon" disabled>CAMPAIGN<span class="gm-badge">COMING SOON</span></button>' +
+      '<button data-act="dev">DEV TOOLS &#9656;</button>' +
+    '</div>' +
+    '<div class="gm-group" id="gm-dev" style="display:none">' +
+      '<div class="gm-devhdr">DEV TOOLS</div>' +
+      '<button data-act="ava">AI VS AI</button>' +
+      '<div class="gm-toollbl">EDITORS &amp; LABS</div>' +
+      '<a class="gm-tool" href="https://asset-designer.rmrfbase.com" target="_blank" rel="noopener">ASSET DESIGNER &#8599;</a>' +
+      '<a class="gm-tool" href="https://map-designer.rmrfbase.com" target="_blank" rel="noopener">MAP DESIGNER &#8599;</a>' +
+      '<a class="gm-tool" href="https://vehicle-designer.rmrfbase.com" target="_blank" rel="noopener">VEHICLE DESIGNER &#8599;</a>' +
+      '<a class="gm-tool" href="https://sound-lab.rmrfbase.com" target="_blank" rel="noopener">SOUND LAB &#8599;</a>' +
+      '<button data-act="back">&#9666; BACK</button>' +
+    '</div>' +
     '<div class="gm-help" id="gm-help">' +
       '<h4>GOAL</h4>' +
       'Destroy the enemy flag HQ, then send a <b>Firebrat</b> to grab the exposed flag and ride it down your own lift to win.' +
@@ -4070,9 +4100,18 @@ function ensureGameMenu() {
       ).join('') +
     '</div>';
   document.body.appendChild(m);
+  // Swap between the main buttons and the DEV TOOLS submenu (help hides in dev view).
+  function setDevView(on) {
+    m.querySelector('#gm-main').style.display = on ? 'none' : '';
+    m.querySelector('#gm-dev').style.display = on ? '' : 'none';
+    const help = m.querySelector('#gm-help'); if (help) help.style.display = on ? 'none' : '';
+  }
+  m._setDevView = setDevView;
   m.addEventListener('click', e => {
-    const b = e.target.closest('button'); if (!b) return;
+    const b = e.target.closest('button'); if (!b || b.disabled) return;   // CAMPAIGN is disabled
     const act = b.dataset.act;
+    if (act === 'dev') { setDevView(true); return; }
+    if (act === 'back') { setDevView(false); return; }
     if (act === 'ava') { location.href = MENU_BASE + '?aivsai'; return; }
     // PLAYER VS AI: reload into a fresh game after a match; on the first screen just open the hangar.
     if (m.dataset.reload === '1') { location.href = MENU_BASE + '?play'; return; }
@@ -4086,6 +4125,7 @@ function showGameMenu(opts = {}) {
   document.getElementById('gm-title').textContent = opts.header || 'RMRF';
   document.getElementById('gm-sub').textContent = opts.sub || 'ISLAND CTF';
   m.dataset.reload = opts.reload ? '1' : '0';
+  if (m._setDevView) m._setDevView(false);   // always (re)open on the main view
   m.classList.add('show');
   setGarageOverlays(false);   // hide the deploy HUD behind the menu
 }
