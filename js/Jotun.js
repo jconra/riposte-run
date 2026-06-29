@@ -586,9 +586,13 @@ export class Jotun {
       } else {
         this.turretGroup.rotation.y = Math.sin(this.hoverTime * 0.6) * 0.6;
       }
-      // Heavy railgun recoil: the whole head slams back off its rest Z, then settles.
+      // Heavy railgun recoil: the head slams back off its rest, then settles. The kick
+      // runs along the head's AIM (turret yaw), not the hull's Z, so a head turned to
+      // fire off-axis slams straight back down its own barrel.
       this._recoil = decayRecoil(this._recoil, delta, 0.32);
-      this.turretGroup.position.z = this._turretBaseZ + this._recoil * 0.4;
+      const recoilDist = this._recoil * 0.4, ty = this.turretGroup.rotation.y;
+      this.turretGroup.position.x = Math.sin(ty) * recoilDist;
+      this.turretGroup.position.z = this._turretBaseZ + Math.cos(ty) * recoilDist;
     }
     for (const m of this._muzzles) updateMuzzle(m, delta);
     // Skid-steer: turning runs the two belts at opposite rates, so the tracks visibly

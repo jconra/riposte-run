@@ -318,8 +318,12 @@ export class Lurcher {
     }
 
     // Recoil: turret kicks back on a shot and slides forward to rest; flashes fade.
+    // Kick STRAIGHT BACK along the barrels' aim (turret yaw), not the hull's Z — so a
+    // turret rotated to fire sideways recoils sideways too, matching the shot direction.
     this._recoil = decayRecoil(this._recoil, delta, 0.16);
-    this.turretGroup.position.z = this._recoil * 0.22;
+    const recoilDist = this._recoil * 0.22, ty = this.turretGroup.rotation.y;
+    this.turretGroup.position.x = Math.sin(ty) * recoilDist;
+    this.turretGroup.position.z = Math.cos(ty) * recoilDist;
     for (const m of this._muzzles) updateMuzzle(m, delta);
 
     // Subtle body roll into turns
