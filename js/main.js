@@ -410,12 +410,28 @@ const SHOT_SEED = QS.has('seed') ? parseInt(QS.get('seed')) : null;
 // headless render/test rigs stay deterministic. `?seed` always wins.
 const wantSize = SHOT || QS.has('size');
 const MAP_SEED = SHOT_SEED != null ? SHOT_SEED : SHOT ? null : (Math.random() * 2147483647) | 0;
+// ?mapcfg=<base64 JSON> — a map authored in the Map Designer (terrain params + AI
+// rules; placed assets/roads are authored but not yet honoured here). Decoded once;
+// drives the terrain (below) and the AI commanders (applyMapCfgRules).
+const MAP_CFG = (() => {
+  if (!QS.has('mapcfg')) return null;
+  try { return JSON.parse(decodeURIComponent(escape(atob(QS.get('mapcfg'))))); }
+  catch (e) { console.warn('mapcfg: could not decode —', e && e.message); return null; }
+})();
+// A designed map can set the player's (team A / red) fleet — mutate the shared garage
+// counts so the deploy roster reflects it. (Each AI team's fleet is set per-commander.)
+if (MAP_CFG?.rules?.teams?.a?.roster) {
+  for (const [k, v] of Object.entries(MAP_CFG.rules.teams.a.roster))
+    if (k in GARAGE_COUNTS && Number.isFinite(v)) GARAGE_COUNTS[k] = Math.max(0, v | 0);
+}
 // Map generation options, honoured in ANY field mode (so ?aivsai&size&seed is
-// reproducible, not just ?shot). undefined → the map's own fixed default.
-const GEN_OPTS = (wantSize || MAP_SEED != null) ? {
-  ...(wantSize ? { cols: SHOT_SIZE, rows: SHOT_SIZE } : {}),
-  ...(MAP_SEED != null ? { seed: MAP_SEED } : {}),
-} : undefined;
+// reproducible, not just ?shot). undefined → the map's own fixed default. A designed
+// map's `base` params win outright (deterministic: its own seed + shape).
+const GEN_OPTS = (MAP_CFG && MAP_CFG.base) ? { ...MAP_CFG.base }
+  : (wantSize || MAP_SEED != null) ? {
+    ...(wantSize ? { cols: SHOT_SIZE, rows: SHOT_SIZE } : {}),
+    ...(MAP_SEED != null ? { seed: MAP_SEED } : {}),
+  } : undefined;
 // Normal play STARTS IN THE GARAGE (pick team colour + vehicle, then deploy). Only
 // the headless test/spectate paths drop straight onto the field.
 const SPECTATE = QS.has('aivsai') || QS.has('spectate') || QS.has('ai');
@@ -3094,6 +3110,32 @@ class AICommander {
   }
 }
 
+// Designer teams are identity-only ('a'/'b'); the game's internals are 'red'/'blue'.
+// 'a' is the first/player side → red. (Players still pick their colour in-game.)
+const CFG_TEAM_OF = { red: 'a', blue: 'b' };
+function cfgRulesFor(team) {
+  const R = MAP_CFG && MAP_CFG.rules; const t = R && R.teams && R.teams[CFG_TEAM_OF[team]];
+  return t ? { rules: R, team: t } : null;
+}
+// A designed map's difficulty becomes an AI handicap by scaling aim/steer noise
+// (jitter) and decision lag (reaction): easy = sloppier + slower, hard = sharper.
+const DIFF_HANDICAP = { easy: { j: 1.7, r: 1.5 }, normal: { j: 1, r: 1 }, hard: { j: 0.5, r: 0.6 } };
+// Push the designer's per-team rules onto a freshly-built commander: personality
+// knobs, fleet roster, and the difficulty handicap. Archetype is set at construction.
+function applyCfgRules(cmd) {
+  const c = cfgRulesFor(cmd.team); if (!c) return;
+  const T = c.team, p = cmd.personality;
+  if (T.aggression != null) p.aggression = T.aggression;
+  if (T.defensiveness != null) p.defensiveness = T.defensiveness;
+  if (T.triggerHappy != null) p.triggerHappy = T.triggerHappy;
+  const aggMin = cmd.archetype === 'warrior' ? 0.75 : cmd.archetype === 'turtle' ? 0.66 : 0;   // mirror the constructor's floor
+  if (p.aggression < aggMin) p.aggression = aggMin;
+  const k = DIFF_HANDICAP[c.rules.difficulty] || DIFF_HANDICAP.normal;
+  p.jitter = Math.min(1, (p.jitter ?? 0.25) * k.j);
+  p.reaction = (p.reaction ?? 0.3) * k.r;
+  if (T.roster) cmd.roster = { ...cmd.roster, ...T.roster };
+}
+
 // Create an AICommander for every AI-controlled team (called at field build).
 function setupCommanders() {
   commanders.length = 0;
@@ -3101,7 +3143,12 @@ function setupCommanders() {
   const teamIds = [...new Set(camps.filter(c => c.role === 'main').map(c => c.team))];
   const aiTeams = teamIds.filter(t => TEAM_CTRL[t] === 'ai');
   const archs = assignArchetypes(aiTeams.length);   // distinct doctrines → a real contrast each match
-  aiTeams.forEach((t, i) => commanders.push(new AICommander(t, archs[i])));
+  aiTeams.forEach((t, i) => {
+    const designed = cfgRulesFor(t);   // a designed map fixes each side's doctrine
+    const cmd = new AICommander(t, (designed && designed.team.archetype) || archs[i]);
+    applyCfgRules(cmd);
+    commanders.push(cmd);
+  });
   // If no human is playing (e.g. AI-vs-AI spectate), kick everyone off immediately.
   if (!teamIds.some(t => TEAM_CTRL[t] === 'human')) startCommanders(null);
 }
@@ -4391,6 +4438,7 @@ const ray = new THREE.Raycaster();
 // Debug handle (headless verification / console poking).
 window.RR = {
   THREE, scene, camera, map,
+  mapCfg: () => MAP_CFG,                                       // debug: the decoded ?mapcfg (designed map), or null
   get destructibles() { return destructibles; },
   get camps() { return camps; },
   damageTapAt: (x, y) => damageTapAt(x, y),
