@@ -269,7 +269,11 @@ export class Camp {
   // grid: BuildGrid. centerCell: {cx,cz}. size: EVEN number of cells per side
   // (so the 2-cell gate centres perfectly). groundY: common foundation height.
   // role: 'main' (flag HQ + buildings) or 'fob' (elevator).
-  constructor(grid, centerCell, size, team, manager, groundY = 0, role = 'main') {
+  constructor(grid, centerCell, size, team, manager, groundY = 0, role = 'main', opts = {}) {
+    // bare = a DESIGNED/custom map base: skip the procgen wall ring, gates, corner
+    // towers and extra interior buildings, so the real HQ isn't given away by a fort
+    // around it (decoys are bare buildings) — the map's own placed assets take over.
+    const bare = !!opts.bare;
     this.group = new THREE.Group();
     this.walls = [];
     this.buildings = [];
@@ -299,6 +303,7 @@ export class Camp {
       gateAxis === 'x' ? (dx === gs && gateCells.includes(dz))
                        : (dz === gs && gateCells.includes(dx)));
 
+    if (!bare) {
     for (let dx = lo; dx <= hi; dx++) {
       for (let dz = lo; dz <= hi; dz++) {
         const edgeX = dx === lo || dx === hi, edgeZ = dz === lo || dz === hi;
@@ -342,15 +347,16 @@ export class Camp {
         const cz = gateAxis === 'x' ? centerCell.cz + gc : centerCell.cz + gs;
         this.openCells.add(cx + ',' + cz);
       }
+    }
 
-    this._placeInterior(grid, centerCell, size, groundY, manager, accent);
+    this._placeInterior(grid, centerCell, size, groundY, manager, accent, bare);
   }
 
   // Interior buildings, all snapped to grid cells. The flag HQ sits at the camp
   // centre with the surrounding ring left CLEAR for a road; other buildings go
   // on the interior corner cells. A FOB holds only the elevator (more room only
   // if it's enlarged).
-  _placeInterior(grid, centerCell, size, groundY, manager, accent) {
+  _placeInterior(grid, centerCell, size, groundY, manager, accent, bare = false) {
     const cell = grid.cell;
     const h = (size - 1) / 2;
     const inLo = -h + 1, inHi = h - 1;     // interior (non-edge) cell range
@@ -380,10 +386,12 @@ export class Camp {
       // hidden inside until this building falls — so we keep a handle to its
       // Destructible for the reveal check.
       this.flagHQ = addAt(makeFlagHQ(cell, accent), centreX, centreZ, 600, 'flagHQ');   // centre; ring around = road
-      addCell(makeAdmin(cell, accent), inLo, inHi, 160, 'admin');
-      addCell(makeQuonset(cell, accent), inHi, inHi, 140, 'quonset', Math.PI / 2);
-      addCell(makeBarracks(cell, accent), inLo, inLo, 120, 'barracks');
-      addCell(makeTent(cell, accent), inHi, inLo, 50, 'tent');
+      if (!bare) {   // custom maps: just the HQ (identical to the decoys) — no extra base buildings
+        addCell(makeAdmin(cell, accent), inLo, inHi, 160, 'admin');
+        addCell(makeQuonset(cell, accent), inHi, inHi, 140, 'quonset', Math.PI / 2);
+        addCell(makeBarracks(cell, accent), inLo, inLo, 120, 'barracks');
+        addCell(makeTent(cell, accent), inHi, inLo, 50, 'tent');
+      }
     }
   }
 

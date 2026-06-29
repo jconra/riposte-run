@@ -24,7 +24,7 @@ import {
   makeQuonset, makeTent, makeElevator,
 } from './Buildings.js?v=3';
 import { makeFuelTank, makeAmmoDepot, makeShieldGenerator } from './Resupply.js';   // no ?v: match main.js so the module dedupes
-import { makeWall, makeTower, makeGate } from './Walls.js?v=59';   // perimeter kit (visual makers; Wall/Camp classes do the combat)
+import { makeWall, makeTower, makeGate } from './Walls.js?v=60';   // perimeter kit (visual makers; Wall/Camp classes do the combat)
 
 export const ASSETS = [
   // ── Structures ─────────────────────────────────────────────────────────────

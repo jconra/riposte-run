@@ -89,7 +89,9 @@ function makeRoadTexture(n, s, e, w) {
   return tex;
 }
 
-class RoadTiles {
+// Exported so the map designer can render hand-painted roads with the EXACT same
+// tiles/textures/grade as the game (one source of truth) instead of a look-alike.
+export class RoadTiles {
   constructor(cell, heightFn) {
     this.group = new THREE.Group();
     this.width = cell;

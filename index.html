@@ -8,8 +8,38 @@
     <script src="/oops.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        html, body { height: 100%; overflow: hidden; background: #bfe4f5; }
+        html, body { height: 100%; overflow: hidden; background: #0c1118; }
         canvas { display: block; }
+        /* Instant dark loading splash — paints before any JS/Three.js loads so the
+           page never flashes a blank light-blue panel. Removed on first render. */
+        #boot-splash {
+            position: fixed; inset: 0; z-index: 9999;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            background: radial-gradient(circle at 50% 42%, #16202b 0%, #0c1118 70%);
+            font-family: 'Courier New', monospace;
+            transition: opacity 0.45s ease;
+        }
+        #boot-splash.gone { opacity: 0; pointer-events: none; }
+        #boot-splash .bs-word {
+            font-size: 40px; font-weight: bold; letter-spacing: 14px;
+            color: #cfe3ef; text-indent: 14px;
+            text-shadow: 0 2px 10px rgba(0,0,0,0.6);
+            animation: bs-pulse 1.4s ease-in-out infinite;
+        }
+        /* Fake shell line — commands type out for flavour (RMRF = rm -rf). */
+        #boot-splash .bs-term {
+            margin-top: 30px; width: 340px; max-width: 84vw; text-align: left;
+            font-size: 13px; letter-spacing: 1px; white-space: nowrap;
+            color: rgba(207,227,239,0.78);
+        }
+        #boot-splash .bs-prompt { color: #d9a441; margin-right: 8px; }
+        #boot-splash .bs-cursor {
+            display: inline-block; width: 8px; height: 15px;
+            margin-left: 2px; vertical-align: -2px;
+            background: #cfe3ef; animation: bs-blink 1s step-end infinite;
+        }
+        @keyframes bs-blink { 0%,50% { opacity: 1; } 50.01%,100% { opacity: 0; } }
+        @keyframes bs-pulse { 0%,100% { opacity: 0.55; } 50% { opacity: 1; } }
         #hud {
             position: absolute; top: 14px; left: 14px; pointer-events: none;
             font-family: 'Courier New', monospace; color: #2b2118;
@@ -123,6 +153,49 @@
     </style>
 </head>
 <body>
+    <!-- Instant loading splash (see #boot-splash CSS). main.js calls
+         window.__rmrfHideSplash() after the first frame renders. -->
+    <div id="boot-splash">
+        <div class="bs-word">RMRF</div>
+        <div class="bs-term"><span class="bs-prompt">$</span><span id="bs-cmd"></span><span class="bs-cursor"></span></div>
+    </div>
+    <script>
+        window.__rmrfHideSplash = function () {
+            var s = document.getElementById('boot-splash');
+            if (!s) return;
+            s.classList.add('gone');
+            setTimeout(function () { s.remove(); }, 500);
+        };
+        // Type fake shell commands out, char by char, looping until the splash clears.
+        (function () {
+            var el = document.getElementById('bs-cmd');
+            if (!el) return;
+            var cmds = [
+                'rm -rf /enemy_base',
+                'sudo ./deploy_tank.sh --team a',
+                './capture_the_flag.sh',
+                'git push --force the-front-line',
+                'mount /dev/island --rw',
+                'chmod 777 /victory'
+            ];
+            var ci = 0, n = 0, mode = 'type';
+            function tick() {
+                if (!document.getElementById('boot-splash')) return;  // splash gone → stop
+                var cmd = cmds[ci];
+                if (mode === 'type') {
+                    n++; el.textContent = cmd.slice(0, n);
+                    if (n >= cmd.length) { mode = 'erase'; return setTimeout(tick, 1100); }
+                    setTimeout(tick, 50 + Math.random() * 65);
+                } else {
+                    n -= 2; if (n < 0) n = 0;
+                    el.textContent = cmd.slice(0, n);
+                    if (n <= 0) { ci = (ci + 1) % cmds.length; mode = 'type'; return setTimeout(tick, 320); }
+                    setTimeout(tick, 22);
+                }
+            }
+            tick();
+        })();
+    </script>
     <!-- In-game top-left title removed — the title lives on the menu screen now. -->
     <div id="hud"></div>
     <div id="player-bars" style="display:none">
@@ -151,6 +224,6 @@
         }
     }
     </script>
-    <script type="module" src="js/main.js?v=224"></script>
+    <script type="module" src="js/main.js?v=229"></script>
 </body>
 </html>

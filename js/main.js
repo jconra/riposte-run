@@ -8,11 +8,11 @@ import { Controls } from './Controls.js';
 import { DestructibleManager, Destructible } from './Destructible.js?v=5';
 import { applyStaging } from './AssetStaging.js?v=1';
 import { BuildGrid } from './BuildGrid.js';
-import { Camp } from './Walls.js?v=59';
+import { Camp, Wall } from './Walls.js?v=60';
 import { makeFlagHQ } from './Buildings.js?v=3';   // decoy HQ buildings on designed maps
-import { RoadNetwork } from './Roads.js?v=80';
+import { RoadNetwork } from './Roads.js?v=81';
 import { Foliage } from './Foliage.js?v=4';
-import { makeVehicleShadow, vehicleSilhouette } from './BlobShadow.js?v=1';
+import { makeVehicleShadow, vehicleSilhouette, makeBlobShadow } from './BlobShadow.js?v=1';
 import { Vehicle, VEHICLE_TYPES } from './Vehicles.js?v=67';
 import { Elevator } from './Elevator.js?v=3';
 import { Garage, GARAGE_COUNTS } from './Garage.js?v=6';
@@ -658,6 +658,8 @@ const grid = new BuildGrid(map, 5);   // shared build grid (5-unit cells)
 const roadNet = new RoadNetwork(map, grid);
 let destructibles = new DestructibleManager();
 let camps = [];
+let configBases = false;   // true when bases came from a DESIGNED map (no procgen walls/roads)
+let placedWalls = [];      // designer-placed wall/tower/gate combat pieces (custom maps)
 let elevators = [];   // animated FOB surface lifts (one per forward base)
 let resupplies = [];  // neutral fuel/ammo/shield points of interest
 let onField = false;  // true while the island is on screen (false = hangar view)
@@ -697,6 +699,7 @@ function nearestGate(camp, point) {
 
 // Build the road network: each main base -> its FOB, and the two FOBs across.
 function buildRoads() {
+  if (configBases) return;   // designed/custom maps don't auto-route procgen roads (bare camps have no gates)
   const byTeam = {};
   for (const c of camps) (byTeam[c.team] ??= {})[c.role] = c;
   const conns = [];
@@ -722,6 +725,9 @@ function padFor(site, size) {
 }
 
 function placeCamps() {
+  configBases = false;   // procedural map → full procgen forts + roads
+  for (const w of placedWalls) scene.remove(w.group);
+  placedWalls = [];
   for (const c of camps) scene.remove(c.group);
   for (const e of elevators) { scene.remove(e.group); if (e.rider) scene.remove(e.rider.group); e.dispose(); }
   camps = [];
@@ -813,10 +819,12 @@ function placeCampsFromConfig(assets) {
   const ok = TEAMS.every(([dt]) =>
     hqs.some(h => (h.team || 'neutral') === dt) && elevs.some(e => (e.team || 'neutral') === dt));
   if (!ok) { console.warn('mapcfg: each team needs a flag HQ + an elevator — falling back to procedural bases'); placeCamps(); return; }
+  configBases = true;   // designed map → bare bases (no procgen wall ring / extra buildings / auto roads)
 
+  for (const w of placedWalls) scene.remove(w.group);
   for (const c of camps) scene.remove(c.group);
   for (const e of elevators) { scene.remove(e.group); if (e.rider) scene.remove(e.rider.group); e.dispose(); }
-  camps = []; elevators = []; destructibles = new DestructibleManager();
+  camps = []; elevators = []; placedWalls = []; destructibles = new DestructibleManager();
 
   const items = [];   // { cell, site, size, role, team }  (parallel to camps[])
   const pads = [];
@@ -841,7 +849,7 @@ function placeCampsFromConfig(assets) {
 
   for (const it of items) {
     const groundY = map.heightAt(it.site.x, it.site.z);
-    const c = new Camp(grid, it.cell, it.size, it.team, destructibles, groundY, it.role);
+    const c = new Camp(grid, it.cell, it.size, it.team, destructibles, groundY, it.role, { bare: true });
     scene.add(c.group); camps.push(c);
   }
   // Decoy HQs — same maker as the real one, registered as plain destructibles (no flag).
@@ -853,6 +861,30 @@ function placeCampsFromConfig(assets) {
     scene.add(g);
     applyStaging(g, 'flagHQ');
     destructibles.add(new Destructible(g, { type: 'structure', hp: 600, blocks: true, staged: true }));
+  }
+  // Placed fortifications: build the designer's wall/tower/gate placements as REAL combat
+  // Wall pieces (HP + staged crumble + firing corner turrets), so you can fortify the real
+  // base AND arm the decoys. id+rot → Wall type: tower=CORNER (turret), gate=GATE (span 3),
+  // wall=NS/EW by rotation. (Orientation convention: rot 0/2 = EW run / drive-through Z;
+  // rot 1/3 = NS run / drive-through X — flip here if a placement reads turned 90°.)
+  const wallType = (id, rot) => {
+    if (id === 'tower') return 'CORNER';
+    const horiz = ((rot || 0) % 2) === 0;
+    if (id === 'gate') return horiz ? 'GATE_EW' : 'GATE_NS';
+    return horiz ? 'EW' : 'NS';
+  };
+  for (const a of assets) {
+    if (a.id !== 'wall' && a.id !== 'tower' && a.id !== 'gate') continue;
+    const s = siteOfCell(a.cx, a.cz);
+    const dtm = a.team || 'neutral';
+    const gameTeam = dtm === 'a' ? 'red' : dtm === 'b' ? 'blue' : null;
+    const w = new Wall({
+      type: wallType(a.id, a.rot), world: new THREE.Vector3(s.x, map.heightAt(s.x, s.z), s.z),
+      cell: grid.cell, team: gameTeam, accent: new THREE.Color(TEAM_ACCENT[dtm] || '#8a8f8a'),
+      manager: destructibles, span: a.id === 'gate' ? 3 : 1,
+    });
+    w._team = gameTeam;   // turret targeting (null = neutral, fires on everyone)
+    scene.add(w.group); placedWalls.push(w);
   }
   scene.updateMatrixWorld(true);
   destructibles.refreshAll();
@@ -1015,19 +1047,35 @@ const combatants = [];         // every live, damageable Vehicle (player + AI)
 const vehShadows = new THREE.Group(); scene.add(vehShadows);   // ground-projected vehicle silhouette shadows
 // Drape each vehicle's baked silhouette shadow flat on the terrain beneath it, turned to
 // its heading and faded/shrunk a little with altitude (flyers cast a fainter, lower shadow).
+// Types that WALK (the Lurcher's striding legs): a frozen leg-shaped silhouette looks
+// wrong dragged along, so these get a soft round blob instead — reads as a shadow
+// without pinning a static leg pose under a moving vehicle.
+const WALKER_SHADOW = new Set(['lurcher']);
 function updateShadows() {
   for (const v of combatants) {
     if (!v.model) continue;
-    if (!v._shadow) { v._shadow = makeVehicleShadow(vehicleSilhouette(renderer, v.type, v.model.group)); vehShadows.add(v._shadow); }
+    if (!v._shadow) {
+      if (WALKER_SHADOW.has(v.type)) {
+        const rec = vehicleSilhouette(renderer, v.type, v.model.group);   // cached; used only for footprint size
+        v._shadowR = rec.size * 0.5;                                       // blob radius ≈ footprint
+        v._shadow = makeBlobShadow(v._shadowR, true);                      // clone material so we can fade per-frame
+      } else {
+        v._shadow = makeVehicleShadow(vehicleSilhouette(renderer, v.type, v.model.group));
+      }
+      vehShadows.add(v._shadow);
+    }
     const s = v._shadow;
     if (v.dead) { s.visible = false; continue; }
-    const x = v.holder.position.x, z = v.holder.position.z, gy = map.heightAt(x, z);
+    const x = v.holder.position.x, z = v.holder.position.z;
+    const roadY = roadDeckY(x, z);                       // on a raised road slab? drape on its top, not the terrain below it
+    const gy = roadY != null ? roadY : map.heightAt(x, z);
     const alt = Math.max(0, v.holder.position.y - gy);
     const f = 1 / (1 + alt * 0.14);   // 1 on the ground → fainter/smaller as it climbs
     s.visible = true;
     s.position.set(x, gy + 0.07, z);
     s.rotation.y = v.holder.rotation.y;
-    s.scale.setScalar(0.7 + 0.3 * f);
+    if (v._shadowR) { const d = v._shadowR * 2 * (0.7 + 0.3 * f); s.scale.set(d, 1, d); }
+    else s.scale.setScalar(0.7 + 0.3 * f);
     s.material.opacity = 0.5 * f;
   }
 }
@@ -1554,37 +1602,39 @@ function turretFalloff(dist) {
   if (dist >= far) return farMult;
   return 1 - (1 - farMult) * (dist - near) / (far - near);
 }
+// One corner turret's aim + fire. `team` = the owner (a base camp's team, or a placed
+// piece's _team); a null team (neutral placed tower) has no friendlies, so it fires on all.
+function tickWallTurret(w, team, dt) {
+  const t = w.turret;
+  if (!t || t.dead || t.falling) return;
+  t._cd = (t._cd || 0) - dt;
+  t.group.updateWorldMatrix(true, false);
+  t.head.getWorldPosition(_tHead);
+  // nearest enemy vehicle in range (turrets sit above the parapet → no wall-LOS check)
+  let target = null, bestD = TURRET_RANGE * TURRET_RANGE;
+  for (const v of combatants) {
+    if (v.dead || (team && v.team === team) || vehicleHidden(v)) continue;   // can't shoot a unit still down its lift shaft
+    const dx = v.holder.position.x - _tHead.x, dz = v.holder.position.z - _tHead.z;
+    const d2 = dx * dx + dz * dz;
+    if (d2 < bestD) { bestD = d2; target = v; }
+  }
+  if (!target) { t.aimYaw = null; return; }   // nothing in range → idle sweep
+  const tp = target.holder.position;
+  t.aimYaw = Math.atan2(tp.x - _tHead.x, tp.z - _tHead.z);   // barrels point +Z local; swing the head onto it
+  if (t._cd <= 0) {
+    t._cd = TURRET_CD;
+    // Damage the locked target directly (with range falloff) + a cosmetic tracer.
+    // Direct, so the slug can't clip the turret's OWN walls on the way out.
+    damageVehicle(target, TURRET_DMG * turretFalloff(Math.sqrt(bestD)), 'turret');
+    _tDir.copy(tp).sub(_tHead).normalize();
+    const hex = TEAM_ACCENT[team] ? new THREE.Color(TEAM_ACCENT[team]).getHex() : 0xffd0a0;
+    projectiles.spawn(0, _tHead.clone(), _tDir.clone(), hex);   // cosmetic tracer toward the target
+  }
+}
 function updateWallTurrets(dt) {
   if (matchOver) return;
-  for (const c of camps) {
-    for (const w of c.walls) {
-      const t = w.turret;
-      if (!t || t.dead || t.falling) continue;
-      t._cd = (t._cd || 0) - dt;
-      t.group.updateWorldMatrix(true, false);
-      t.head.getWorldPosition(_tHead);
-      // nearest enemy vehicle in range (turrets sit above the parapet → no wall-LOS check)
-      let target = null, bestD = TURRET_RANGE * TURRET_RANGE;
-      for (const v of combatants) {
-        if (v.dead || v.team === c.team || vehicleHidden(v)) continue;   // can't shoot a unit still down its lift shaft
-        const dx = v.holder.position.x - _tHead.x, dz = v.holder.position.z - _tHead.z;
-        const d2 = dx * dx + dz * dz;
-        if (d2 < bestD) { bestD = d2; target = v; }
-      }
-      if (!target) { t.aimYaw = null; continue; }   // nothing in range → idle sweep
-      const tp = target.holder.position;
-      t.aimYaw = Math.atan2(tp.x - _tHead.x, tp.z - _tHead.z);   // barrels point +Z local; swing the head onto it
-      if (t._cd <= 0) {
-        t._cd = TURRET_CD;
-        // Damage the locked target directly (with range falloff) + a cosmetic tracer.
-        // Direct, so the slug can't clip the turret's OWN walls on the way out.
-        damageVehicle(target, TURRET_DMG * turretFalloff(Math.sqrt(bestD)), 'turret');
-        _tDir.copy(tp).sub(_tHead).normalize();
-        const hex = TEAM_ACCENT[c.team] ? new THREE.Color(TEAM_ACCENT[c.team]).getHex() : 0xffd0a0;
-        projectiles.spawn(0, _tHead.clone(), _tDir.clone(), hex);   // cosmetic tracer toward the target
-      }
-    }
-  }
+  for (const c of camps) for (const w of c.walls) tickWallTurret(w, c.team, dt);
+  for (const w of placedWalls) tickWallTurret(w, w._team, dt);   // placed tower turrets fire too
 }
 
 function nearestEnemyVehicle(point, pad, team, shooter) {
@@ -2271,6 +2321,7 @@ function planPath(v, dest) {
   const inBounds = (i, j) => i >= -iMax && i <= iMax && j >= -jMax && j <= jMax;
   const roads = roadNet.cells;
   const arch = v._archetype;
+  const sinks = v._move.water === 'sink';   // Lurcher/Jotun: can ford shallows but bog down doing it
   const onRoad = (i, j) => roads && (roads.has(i + ',' + j) || gateCells.has(i + ',' + j));
   // Personality terrain preference (ai_behavior): each commander has its OWN cheap highway.
   // Warrior (and the player/default) uses ROADS; the Rogue sneaks over OCEAN; the Hunter
@@ -2278,6 +2329,10 @@ function planPath(v, dest) {
   // cellBlocked already bars sinkers from deep water and light units from trees.
   const cost = (i, j) => {
     if (cellBlocked(v, i, j)) return Infinity;
+    // SINK vehicles wade through shallow water but bog there (slow, and they can drift into
+    // deep water and flood) — so make off-road shallows EXPENSIVE: A* keeps them on land/roads
+    // and only fords when there's genuinely no dry route. Overrides any archetype water love.
+    if (sinks && !onRoad(i, j) && !map.isLand(i * c, j * c)) return 10;
     if (arch === 'rogue') return !map.isLand(i * c, j * c) ? 0.45 : (onRoad(i, j) ? 0.8 : 1);
     if (arch === 'hunter') return forestHas(i + ',' + j) ? 0.45 : (onRoad(i, j) ? 0.8 : 1);
     return onRoad(i, j) ? 0.5 : 1;   // Warrior + default: roads are the cheap lane
@@ -3683,6 +3738,22 @@ function buildObstacles() {
     obstacles.push({ x: w.group.position.x, z: w.group.position.z, team: c.team, body: w.body,
                      r: w.type === 'CORNER' ? grid.cell * 0.7 : grid.cell * 0.5 });
   }
+  // Designer-placed forts: walls/towers block as circles; gates block their two posts
+  // and leave the centre cell drivable (so a placed gate is a real opening in a wall line).
+  for (const w of placedWalls) {
+    if (w.type && w.type.startsWith('GATE')) {
+      const isEW = w.type === 'GATE_EW';
+      const off = (w.span * c0) / 2 - c0 * 0.15;   // posts near the span's ends
+      for (const s of [-1, 1]) {
+        const px = isEW ? w.group.position.x + s * off : w.group.position.x;
+        const pz = isEW ? w.group.position.z : w.group.position.z + s * off;
+        obstacles.push({ x: px, z: pz, team: w._team, body: w.body, r: c0 * 0.35 });
+      }
+      continue;
+    }
+    obstacles.push({ x: w.group.position.x, z: w.group.position.z, team: w._team, body: w.body,
+                     r: w.type === 'CORNER' ? c0 * 0.7 : c0 * 0.5 });
+  }
   // The flag HQ is a SOLID building, not a drive-through. Add it as an obstacle so vehicles
   // STOP at it (and a sieger nosed against it shoots it down — that's the breach path that
   // actually cracks the HQ + exposes the flag) and A* routes around it instead of plowing
@@ -4547,6 +4618,7 @@ window.RR = {
   mapCfg: () => MAP_CFG,                                       // debug: the decoded ?mapcfg (designed map), or null
   get destructibles() { return destructibles; },
   get camps() { return camps; },
+  get placedWalls() { return placedWalls; },                   // debug: designer-placed fort pieces (custom maps)
   damageTapAt: (x, y) => damageTapAt(x, y),
   rebuild: (patch) => rebuild(patch),
   frame: () => frameMap(),
@@ -4871,6 +4943,7 @@ function updateSoundHud(dt) {
   for (const s of soundSources(listener)) drawEdgeGlow(g, W, H, s);
 }
 
+let _splashHidden = false;
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(0.05, clock.getDelta());
@@ -4897,6 +4970,7 @@ function animate() {
       trackVelocities(dt);                 // per-vehicle velocity for AI aim-leading
       if (!matchOver) updateCommanders(dt);  // AI teams (fog-of-war) + flag carry/capture — frozen on win
       for (const c of camps) c.update(dt);
+      for (const w of placedWalls) w.update(dt);   // placed fort crumble + turret swing
       for (const e of elevators) e.update(dt);
       for (const v of vehicles) v.idle(dt);
       updateShadows();                       // ground-projected vehicle silhouette shadows
@@ -4941,6 +5015,11 @@ function animate() {
         fade.style.opacity = Math.max(0, 1 - fieldFadeT / 1.3);
       }
     }
+  }
+
+  if (!_splashHidden) {                    // first frame rendered → drop the loading splash
+    _splashHidden = true;
+    if (window.__rmrfHideSplash) window.__rmrfHideSplash();
   }
 
   perfTick++;
