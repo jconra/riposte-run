@@ -4,6 +4,8 @@
 
 import * as THREE from 'three';
 import { concreteTexture, ribbedMetalTexture, fabricTexture, crateTexture, roofTexture, accentPlateTexture } from './Textures.js?v=2';
+import { buildAssetGroup } from './AssetBuilder.js?v=1';
+import FLAGHQ_CFG from './flaghq.config.js?v=1';
 
 // Shared neutral plate map tinted per-material by the team accent (matches Walls.js).
 const ACCENT_TEX = accentPlateTexture();
@@ -28,21 +30,12 @@ function accentMat(accent) {
   return m;
 }
 
-// Command HQ with a team flag — the heart of a main base.
+// Command HQ — the heart of a main base, and the decoy buildings on designed maps.
+// The geometry is Jacob's asset-designer creation (js/flaghq.config.js), assembled by
+// the generic AssetBuilder; team-flagged parts take the accent and stay setAccent-able.
+// (The capturable flag itself is a separate system — Camp/buildFlags — not this mesh.)
 export function makeFlagHQ(cell, accent) {
-  const g = new THREE.Group();
-  const am = accentMat(accent);
-  const base = box(cell * 1.7, cell * 1.0, cell * 1.7, STONE);
-  base.position.y = cell * 0.5; g.add(base);
-  const band = box(cell * 1.75, cell * 0.22, cell * 1.75, am);
-  band.position.y = cell * 0.9; g.add(band);
-  const top = box(cell * 1.0, cell * 0.7, cell * 1.0, STONE);
-  top.position.y = cell * 1.35; g.add(top);
-  const mast = box(cell * 0.07, cell * 1.3, cell * 0.07, METAL);
-  mast.position.y = cell * 2.0; g.add(mast);
-  const flag = box(cell * 0.7, cell * 0.42, cell * 0.05, am);
-  flag.position.set(cell * 0.4, cell * 2.45, 0); g.add(flag);
-  return g;
+  return buildAssetGroup(FLAGHQ_CFG, accent, { cell });
 }
 
 // Low barracks hut with an accent door stripe.
