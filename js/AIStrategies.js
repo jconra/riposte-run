@@ -63,9 +63,16 @@ class Attack extends Mission {
 // SIEGE — level the enemy base, turret-first, until the flag is exposed.
 class Siege extends Mission {
   get key() { return 'siege'; }
+  // CLOSER: once the enemy is ELIMINATED (out for good — no units, roster empty) there's
+  // no return fire to fear, so mobility/stealth stop mattering and raw demolition wins.
+  // Field a JOTUN — its railgun levels turrets + the HQ far faster than a Valkyrie's
+  // long-range chip fire (which the audit showed barely dents a structure, so a decided
+  // match just stalled with a lone flyer idling at the wall). _pickAvailableType falls
+  // back (jotun → lurcher → valkyrie) if we're out of railguns.
+  wantVehicle(cmd) { return cmd.enemyEliminated() ? 'jotun' : this.doc.role(this.key); }
   objective(cmd) { return cmd.enemyBasePos(); }
   arriveDist(cmd) { return cmd.unit && cmd.unit.type === 'valkyrie' ? 26 : 12; }   // flyers shell from standoff
-  label(cmd) { return 'the enemy base'; }
+  label(cmd) { return cmd.enemyEliminated() ? 'levelling the undefended base' : 'the enemy base'; }
 }
 
 // CAPTURE — run a Firebrat for the flag; do NOT engage (the runner flees contact). A Rogue
@@ -146,7 +153,13 @@ class Doctrine {
   tick(cmd, dt) {
     this.t += dt;
     this.mission.tick(cmd, dt);
-    const next = this._urgent(cmd) || this.choose(cmd);
+    let next = this._urgent(cmd);
+    // PRESERVATION (any persona): losing the attrition war → hold under tower cover instead
+    // of trading the last of the army out in the open — UNLESS we can win right now by
+    // grabbing an exposed flag. Sits above the persona's own plan so every archetype turtles
+    // up when it's getting wiped, then resumes its doctrine once it's back on even footing.
+    if (!next && cmd.losingBadly && cmd.losingBadly() && !cmd.flagGrabbable()) next = 'defend';
+    if (!next) next = this.choose(cmd);
     if (next && next !== this.step && (this.t > DWELL || URGENT.has(next))) this._switch(next, cmd);
   }
   // Emergencies that preempt any persona's plan: our flag's been lifted → run it down

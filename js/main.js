@@ -2615,6 +2615,18 @@ class AICommander {
     const ec = commanders.find(c => c.team === tt);
     return !!(ec && ec._eliminated);
   }
+  // Am I losing the war of attrition — few units left AND clearly behind the enemy? A
+  // commander that keeps feeding its last units out into the open just trades its army
+  // away 1-for-1 (the mutual-annihilation the audit found). When behind, pull back to
+  // DEFEND under tower cover and let the winning side overextend into our guns, preserving
+  // what's left for a counter-punch. (A human enemy has no roster, so we never read them
+  // as "ahead" and never turtle against a human on this basis.)
+  losingBadly() {
+    const ec = commanders.find(c => c.team === this.targetTeam());
+    if (!ec) return false;
+    const mine = this.fleetLeft(), theirs = ec.fleetLeft();
+    return mine <= 5 && mine <= theirs - 3;
+  }
   // A holding spot to the SIDE of our flag base — on the enemy-facing edge but offset
   // off the approach lane, inside tower cover. The Turtle ambushes from here and flanks
   // an attacker, instead of huddling on the flag HQ (which is what looked too passive).
@@ -3251,6 +3263,21 @@ class AICommander {
         if (d < threatD) { threatD = d; threat = { x: _threatV.x, y: _threatV.y, z: _threatV.z }; threatCamp = c; }
       }
     }
+    // FALLBACK KEEP: all the turrets are down but the flag HQ still stands. On a SIEGE the
+    // keep BUILDING itself becomes the target, so the base gets levelled — the only way the
+    // flag ever exposes. This is also the ONLY siege target a FLYER can prosecute: a Valkyrie
+    // never earns a ground unit's break-through, so without this it silences the towers and
+    // then stalls over an intact HQ forever, and its side can never win.
+    let hqThreat = false;
+    if (!threat && this.strategy.key === 'siege') {
+      let bestH = Infinity, ec = null;
+      for (const c of camps) {
+        if (c.team === this.team || !c.flagHQ || c.flagHQ.dead) continue;
+        const d = (c.center.x - px) ** 2 + (c.center.z - pz) ** 2;
+        if (d < bestH) { bestH = d; ec = c; }
+      }
+      if (ec) { threat = { x: ec.center.x, y: map.heightAt(ec.center.x, ec.center.z) + 5, z: ec.center.z }; threatCamp = ec; hqThreat = true; }
+    }
     // Is there a CLEAR shot at the nearest tower, and which way to peel around it?
     // `threatLOS` lets the brain hold + fire when it can see the tower, or swing wide
     // to the flank (rather than hammer the wall in front of it) when it can't. The
@@ -3258,14 +3285,27 @@ class AICommander {
     let flankSide = 0, threatLOS = false, threatStand = null;
     if (threat) {
       threatLOS = flyer || hasLOS(px, pz, threat.x, threat.z);
-      if (threatCamp) {
+      // FINISHER: enemy is eliminated → nothing shoots back, so the timid one-gun-at-a-time
+      // standoff is pointless. A heavy planted at its full 64u sniper hold often has NO line
+      // through the base walls, so it never fires and just idles (the audit's "lone jotun
+      // frozen at the wall for 640s"). Close right in instead — at ~22u it clears the wall
+      // ring, gets LOS, and levels turret→turret→HQ.
+      const finisher = this.enemyEliminated();
+      const hold = finisher ? Math.min(22, TURRET_HOLD[v.type] || 22)
+                            : (TURRET_HOLD[v.type] || (ENGAGE_RANGE[v.type] || 36) * 0.9);
+      if (hqThreat) {
+        // The keep IS the base centre, so there's no "radial through a corner tower" to
+        // stand off along — and no other guns left to dodge. Just hold at range on our
+        // current approach line and pour fire in.
+        const ux = px - threat.x, uz = pz - threat.z, um = Math.hypot(ux, uz) || 1;
+        threatStand = { x: threat.x + (ux / um) * hold, z: threat.z + (uz / um) * hold };
+      } else if (threatCamp) {
         const bx = threat.x - threatCamp.center.x, bz = threat.z - threatCamp.center.z;
         const ux = px - threat.x, uz = pz - threat.z;
         flankSide = (bx * uz - bz * ux) >= 0 ? 1 : -1;
         // The one-gun-at-a-time spot: radially OUTSIDE the base through this turret,
         // at the type's hold range — far from the OTHER corner turrets' fire arcs.
         const om = Math.hypot(bx, bz) || 1;
-        const hold = TURRET_HOLD[v.type] || (ENGAGE_RANGE[v.type] || 36) * 0.9;
         threatStand = { x: threat.x + (bx / om) * hold, z: threat.z + (bz / om) * hold };
       }
     }
