@@ -13,6 +13,7 @@ import {
   accentPlateTexture, hazardTexture, noiseTexture, grimeTexture, woodTexture, scratchedTexture,
   toNormalTexture,
 } from './Textures.js?v=6';
+import { getCamoTextures, TEAM_COLORS } from './CamoTexture.js';
 
 const DESIGN_CELL = 5;   // the designer builds on a CELL=5 grid; configs are in those units
 
@@ -59,6 +60,36 @@ function ntex(kind, tile, rot = 0) {
   return t;
 }
 
+// Camo is a special kind: getCamoTextures builds a whole team-coloured SET at once
+// (colour + normal + roughness), keyed by a TEAM_COLORS index, so we can't route it
+// through tex()/ntex(). Resolve the build accent to the nearest team colour so a
+// camo-skinned asset reads in its side's colour, then hand back the requested slot.
+const _camoIdx = new Map();
+function camoIndex(accent) {
+  const c = new THREE.Color(accent ?? 0xffffff), key = c.getHexString();
+  let idx = _camoIdx.get(key);
+  if (idx === undefined) {
+    let best = 0, bestD = Infinity;
+    for (let i = 0; i < TEAM_COLORS.length; i++) {
+      const t = new THREE.Color(TEAM_COLORS[i].hex);
+      const d = (c.r - t.r) ** 2 + (c.g - t.g) ** 2 + (c.b - t.b) ** 2;
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    idx = best; _camoIdx.set(key, idx);
+  }
+  return idx;
+}
+// slot: 'map' | 'normalMap' | 'roughnessMap'. Textures from the cached set are shared;
+// clone only when a non-unit tiling is needed so we don't disturb other users.
+function camoTex(slot, accent, tile) {
+  const t = getCamoTextures(camoIndex(accent))[slot];
+  if (!t) return null;
+  if (tile && (tile[0] !== 1 || tile[1] !== 1)) {
+    const c = t.clone(); c.wrapS = c.wrapT = THREE.RepeatWrapping; c.repeat.set(tile[0], tile[1]); c.needsUpdate = true; return c;
+  }
+  return t;
+}
+
 function buildGeo(part) {
   if (part.geo) return new THREE.BufferGeometryLoader().parse(part.geo);   // frozen/custom mesh
   const p = part.params || {};
@@ -87,9 +118,14 @@ function buildMat(u = {}, accent) {
     if (u.emissive && u.emissive !== '#000000') { mat.emissive = new THREE.Color(u.emissive); mat.emissiveIntensity = u.emissiveIntensity ?? 1; }
   }
   const tile = u.tile || [1, 1], rot = u.rot || 0;
-  if (u.mapKind) mat.map = tex(u.mapKind, tile, rot);
-  if (u.normalKind) { const nm = ntex(u.normalKind, tile, rot); if (nm) { mat.normalMap = nm; const ns = u.normalScale ?? MAT_DEF.normalScale; mat.normalScale.set(ns, ns); } }
-  if (u.specKind && mat.isMeshStandardMaterial) mat.roughnessMap = tex(u.specKind, tile, rot);
+  if (u.mapKind === 'camo') { mat.map = camoTex('map', accent, tile); mat.color.set('#ffffff'); }
+  else if (u.mapKind) mat.map = tex(u.mapKind, tile, rot);
+  if (u.normalKind === 'camo') { const nm = camoTex('normalMap', accent, tile); if (nm) { mat.normalMap = nm; const ns = u.normalScale ?? MAT_DEF.normalScale; mat.normalScale.set(ns, ns); } }
+  else if (u.normalKind) { const nm = ntex(u.normalKind, tile, rot); if (nm) { mat.normalMap = nm; const ns = u.normalScale ?? MAT_DEF.normalScale; mat.normalScale.set(ns, ns); } }
+  if (mat.isMeshStandardMaterial) {
+    if (u.specKind === 'camo') mat.roughnessMap = camoTex('roughnessMap', accent, tile);
+    else if (u.specKind) mat.roughnessMap = tex(u.specKind, tile, rot);
+  }
   if (team) mat.userData.accent = true;                  // lets Camp.setAccent recolour it (map rides along)
   mat.needsUpdate = true;
   return mat;
