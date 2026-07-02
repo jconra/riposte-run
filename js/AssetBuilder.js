@@ -118,17 +118,34 @@ function buildMat(u = {}, accent) {
     if (u.emissive && u.emissive !== '#000000') { mat.emissive = new THREE.Color(u.emissive); mat.emissiveIntensity = u.emissiveIntensity ?? 1; }
   }
   const tile = u.tile || [1, 1], rot = u.rot || 0;
-  if (u.mapKind === 'camo') { mat.map = camoTex('map', accent, tile); mat.color.set('#ffffff'); }
+  const camoSlots = {};   // which texture slots are team-CAMO (a baked, per-colour texture)
+  if (u.mapKind === 'camo') { mat.map = camoTex('map', accent, tile); mat.color.set('#ffffff'); camoSlots.map = true; }
   else if (u.mapKind) mat.map = tex(u.mapKind, tile, rot);
-  if (u.normalKind === 'camo') { const nm = camoTex('normalMap', accent, tile); if (nm) { mat.normalMap = nm; const ns = u.normalScale ?? MAT_DEF.normalScale; mat.normalScale.set(ns, ns); } }
+  if (u.normalKind === 'camo') { const nm = camoTex('normalMap', accent, tile); if (nm) { mat.normalMap = nm; const ns = u.normalScale ?? MAT_DEF.normalScale; mat.normalScale.set(ns, ns); camoSlots.normalMap = true; } }
   else if (u.normalKind) { const nm = ntex(u.normalKind, tile, rot); if (nm) { mat.normalMap = nm; const ns = u.normalScale ?? MAT_DEF.normalScale; mat.normalScale.set(ns, ns); } }
   if (mat.isMeshStandardMaterial) {
-    if (u.specKind === 'camo') mat.roughnessMap = camoTex('roughnessMap', accent, tile);
+    if (u.specKind === 'camo') { mat.roughnessMap = camoTex('roughnessMap', accent, tile); camoSlots.roughnessMap = true; }
     else if (u.specKind) mat.roughnessMap = tex(u.specKind, tile, rot);
   }
   if (team) mat.userData.accent = true;                  // lets Camp.setAccent recolour it (map rides along)
+  // Camo is a BAKED per-team-colour texture, not a .color — setAccent can't tint it, it has to
+  // swap the whole set. Tag the mat + remember its tiling + which slots so recolorCamo() can
+  // re-fetch the right colour's textures when the player picks/locks their team colour.
+  if (Object.keys(camoSlots).length) mat.userData.camo = { tile, slots: camoSlots };
   mat.needsUpdate = true;
   return mat;
+}
+
+// Re-skin a camo material for a new team colour (setAccent). Camo textures are baked per
+// colour, so we swap the whole cached set for the nearest team colour to `accent` instead
+// of tinting. No-op on non-camo mats. Keeps the mat's original tiling.
+export function recolorCamo(mat, accent) {
+  const c = mat.userData && mat.userData.camo; if (!c) return false;
+  if (c.slots.map) mat.map = camoTex('map', accent, c.tile);
+  if (c.slots.normalMap) mat.normalMap = camoTex('normalMap', accent, c.tile);
+  if (c.slots.roughnessMap) mat.roughnessMap = camoTex('roughnessMap', accent, c.tile);
+  mat.needsUpdate = true;
+  return true;
 }
 
 // Build the asset's Group (base at y=0). `accent` = team colour for team-flagged parts;

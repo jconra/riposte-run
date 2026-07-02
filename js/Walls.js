@@ -9,7 +9,7 @@ import { Destructible } from './Destructible.js?v=5';
 import { applyStaging } from './AssetStaging.js?v=1';
 import { makeFlagHQ, makeBarracks, makeDepot, makeElevator, makeAdmin, makeQuonset, makeTent } from './Buildings.js?v=3';
 import { concreteTexture, accentPlateTexture } from './Textures.js?v=2';
-import { buildAssetGroup } from './AssetBuilder.js?v=1';
+import { buildAssetGroup, recolorCamo } from './AssetBuilder.js?v=1';
 import CORNER_TOWER_CFG from './corner_tower.config.js?v=1';
 
 const STONE = new THREE.MeshStandardMaterial({ color: '#ffffff', map: concreteTexture('#9a948a'), roughness: 0.95 });
@@ -153,6 +153,12 @@ export class Wall {
       // barrels. Wrap it so `group` (the toppling unit that _animate moves) and `head` (what
       // aims + can detach on destroy) stay distinct objects. Gun sheds at its own threshold.
       const group = new THREE.Group();
+      // Carry the gun's HEIGHT on the wrapper (head sits high in the tower). _animate topples
+      // `group`, so if it stayed at y=0 the settle check (y<=0.25) tripped instantly and the
+      // gun hovered at head's height instead of falling. Put the group AT the gun and zero the
+      // head's local offset — same render + same aim pivot, but now gravity drops it to ground.
+      group.position.copy(head.position);
+      head.position.set(0, 0, 0);
       group.add(head);
       this.group.add(group);
       const thr = head.children.map(m => m.userData.fallAt ?? 0).filter(v => v > 0);
@@ -476,7 +482,10 @@ export class Camp {
     this.group.traverse(o => {
       if (!o.isMesh || !o.material) return;
       const mats = Array.isArray(o.material) ? o.material : [o.material];
-      for (const m of mats) if (m.userData && m.userData.accent) m.color.set(hex);
+      for (const m of mats) {
+        if (m.userData && m.userData.accent) m.color.set(hex);
+        if (m.userData && m.userData.camo) recolorCamo(m, this.accent);   // rebuild baked camo for the new team colour
+      }
     });
   }
 
