@@ -3146,7 +3146,19 @@ class AICommander {
         this._planExit();   // ground units must aim at a GATE and drive out before pursuing
       } else { return; }
     }
-    if (this._recalling) { this._driveHome(dt); return; }   // heading back to base to swap
+    if (this._recalling) {
+      // Jumped on the way home? ABORT the swap and hand back to the normal brain, which runs
+      // enemy detection + fight-or-flight (facing/focus) — don't crawl home defenceless and
+      // get shot in the back. _maybeRecall re-defers the swap (its own combat guard) until the
+      // rival is dealt with. Coast clear → keep driving home to swap as before.
+      const up = this.unit.holder.position; let threatened = false;
+      for (const o of combatants) {
+        if (o.dead || o.team === this.team || vehicleHidden(o)) continue;
+        if ((o.holder.position.x - up.x) ** 2 + (o.holder.position.z - up.z) ** 2 < 46 * 46) { threatened = true; break; }
+      }
+      if (!threatened) { this._driveHome(dt); return; }
+      this._recalling = false; this._stepAtDeploy = null;   // fall through to the brain to fight/flee
+    }
     this.strategy.tick(this, dt);
     this._maybeRecall();
     if (this._recalling) return;   // just started the trip home
