@@ -2418,7 +2418,15 @@ function cellBlocked(v, i, j) {
     if (e !== undefined) { if (e > performance.now()) return true; navAvoid.delete(i + ',' + j); }
   }
   const m = v._move;
-  if (m.water === 'sink' && map.isDeepWater(x, z)) return true;   // sinkers route around DEEP water; shallow is fordable
+  if (m.water === 'sink' && !map.isLand(x, z)) {
+    // A sinker fords only SHALLOW water, and only where the whole HULL clears deep water. A*
+    // checks the cell centre but the collision checks the hull radius — so plan with a margin,
+    // or the wide hull straddles an adjacent deep cell, the collision stops it, and it wedges at
+    // the shore following a path line out over water it can't cross (the "stuck fording" bug).
+    if (map.isDeepWater(x, z)) return true;
+    const r = VEH_R * 0.85;
+    if (map.isDeepWater(x + r, z) || map.isDeepWater(x - r, z) || map.isDeepWater(x, z + r) || map.isDeepWater(x, z - r)) return true;
+  }
   if (!m.ignoreWalls) {
     const margin = VEH_R * 0.9;   // ≈ collision's full VEH_R, so A* won't route into a corner the hull can't enter
     for (const o of obstacles) {
@@ -2476,7 +2484,7 @@ function planPath(v, dest) {
     // SINK vehicles wade through shallow water but bog there (slow, and they can drift into
     // deep water and flood) — so make off-road shallows EXPENSIVE: A* keeps them on land/roads
     // and only fords when there's genuinely no dry route. Overrides any archetype water love.
-    if (sinks && !onRoad(i, j) && !map.isLand(i * c, j * c)) return 10;
+    if (sinks && !onRoad(i, j) && !map.isLand(i * c, j * c)) return 35;   // fording is a LAST resort — heavily prefer land/bridges
     if (arch === 'rogue') return !map.isLand(i * c, j * c) ? 0.45 : (onRoad(i, j) ? 0.8 : 1);
     if (arch === 'hunter') return forestHas(i + ',' + j) ? 0.45 : (onRoad(i, j) ? 0.8 : 1);
     return onRoad(i, j) ? 0.5 : 1;   // Warrior + default: roads are the cheap lane
