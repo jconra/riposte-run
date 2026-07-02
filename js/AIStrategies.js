@@ -144,6 +144,12 @@ function makeMission(key) { return new (MISSIONS[key] || Attack)(); }
 const URGENT = new Set(['capture', 'intercept']);
 const DWELL = 1.5;   // seconds a mission must run before a non-urgent switch
 
+// Runner-lost response mode — 'new' = cause-based (attack the interceptor / stealth retry),
+// 'old' = the previous blind re-siege. Runtime-toggleable so a single build can A/B the two
+// on identical (dseed-paired) matchups. Set via RR.setRunnerMode.
+let RUNNER_MODE = 'new';
+export function setRunnerMode(m) { RUNNER_MODE = m; }
+
 class Doctrine {
   constructor(rng = Math.random, log = null) {
     this.rng = rng; this.log = log; this.t = 0;
@@ -187,6 +193,7 @@ class Doctrine {
   // (timed window). Shot by TOWERS on the approach → retry as a STEALTH capture: a wide rear
   // route around the hot zone (the flag's still grabbable, just not head-on).
   onRunnerLost(cmd, byVehicle) {
+    if (RUNNER_MODE === 'old') { this._switch(this.softenKey, cmd); return; }   // A/B baseline: blind re-siege
     if (byVehicle) cmd._clearPathT = 18;
     else cmd._stealthCapture = true;
   }

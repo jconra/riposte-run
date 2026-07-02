@@ -26,7 +26,7 @@ import { Brain, randomPersonality, recStart, recStop, recDump, setBrainConfig, g
 // can run DIFFERENT weights in the same match to see which set actually wins.
 const teamFof = {};
 function fofFor(team) { return teamFof[team] || (teamFof[team] = { ...FOF_DEFAULT }); }
-import { makeDoctrine, pickArchetype, assignArchetypes, COUNTER } from './AIStrategies.js?v=66';
+import { makeDoctrine, pickArchetype, assignArchetypes, COUNTER, setRunnerMode } from './AIStrategies.js?v=66';
 import { ExploreMemory } from './ExploreMemory.js?v=54';
 import { astarGrid } from './astar.js?v=4';
 import { AstarViz } from './AstarViz.js?v=3';
@@ -410,6 +410,12 @@ function updateSpectateTeamButtons() {
 // render rig stays fast on the software-GL box. Gameplay defaults are untouched.
 const QS = new URLSearchParams(location.search);
 const SHOT = QS.has('shot');
+// ?dseed=N seeds the DOCTRINE SETUP (which archetypes + personalities each side gets) with a
+// deterministic PRNG, so two builds/variants can play the EXACT same matchup for a paired A/B
+// — otherwise Math.random gives every run a different Warrior-vs-Turtle-etc game and the noise
+// buries any real difference. Only the setup is seeded; in-match randomness stays live.
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const doctrineRng = QS.has('dseed') ? mulberry32((+QS.get('dseed') >>> 0) || 1) : Math.random;
 const SHOT_SIZE = parseInt(QS.get('size')) || 96;
 const SHOT_FOL = QS.has('fol');
 const SHOT_SEED = QS.has('seed') ? parseInt(QS.get('seed')) : null;
@@ -2551,8 +2557,8 @@ function steerToward(v, wx, wz) {
 class AICommander {
   constructor(team, archetype = null) {
     this.team = team;
-    this.personality = randomPersonality();
-    this.archetype = archetype || pickArchetype(Math.random);   // named doctrine (Warrior/Turtle/...) — drives the whole plan
+    this.personality = randomPersonality(doctrineRng);
+    this.archetype = archetype || pickArchetype(doctrineRng);   // named doctrine (Warrior/Turtle/...) — drives the whole plan
     // The doctrine shapes disposition: both archetypes FIGHT and finish a routed enemy
     // (pursue needs aggression > 0.6). A Warrior presses hardest; a Turtle is still
     // willing to chase a repelled attacker — it just holds a defensive post to do it.
@@ -3449,7 +3455,7 @@ function setupCommanders() {
   if (QS.has('noai')) return;
   const teamIds = [...new Set(camps.filter(c => c.role === 'main').map(c => c.team))];
   const aiTeams = teamIds.filter(t => TEAM_CTRL[t] === 'ai');
-  const archs = assignArchetypes(aiTeams.length);   // distinct doctrines → a real contrast each match
+  const archs = assignArchetypes(aiTeams.length, doctrineRng);   // distinct doctrines → a real contrast each match (seedable via ?dseed)
   aiTeams.forEach((t, i) => {
     const designed = cfgRulesFor(t);   // a designed map fixes each side's doctrine
     const cmd = new AICommander(t, (designed && designed.team.archetype) || archs[i]);
@@ -4842,6 +4848,7 @@ window.RR = {
   setFof: (team, patch) => Object.assign(fofFor(team), patch || {}),                // override this team's fight-or-flight weights (A/B self-play)
   getFof: (team) => ({ ...fofFor(team) }),
   fofDefault: () => ({ ...FOF_DEFAULT }),
+  setRunnerMode: (m) => setRunnerMode(m),   // 'old' | 'new' — A/B the runner-lost response on paired matchups
   exploreFrac: (i = 0) => { const c = commanders[i]; return c && c.explore ? c.explore.fraction() : null; },   // debug: fraction of map this team has scouted
   exploreWp: (i = 0) => { const c = commanders[i]; return c ? c._exploreWp : null; },                          // debug: current recon waypoint
   aiRoster: (i = 0) => { const c = commanders[i]; return c ? { roster: { ...c.roster }, left: c.fleetLeft(), eliminated: c._eliminated } : null; },   // debug: remaining fleet
