@@ -65,55 +65,71 @@ function bailOf(p, cfg, type) {
   return cfg.bailBase - p.aggression * cfg.bailAggr;
 }
 
-// FIGHT-OR-FLIGHT WEIGHT — should this unit pick a fight with the rival it sees, or
-// keep moving and avoid it? A signed score: > 0 = fight, <= 0 = don't engage (carry on
-// the mission / let the hurt-latch pull it out if it's taking fire). Built from the
-// factors Jacob sketched (hp, ammo, shield, fragility, personality) plus the counter web.
+// FIGHT-OR-FLIGHT WEIGHTS — the tunable coefficients of the fightScore sum below. Pulled
+// out of the code into a named table so the auto-tuning gym can sweep/optimise them (and
+// A/B one weight-set against another) WITHOUT editing this file. Defaults reproduce the
+// original hand-tuned behaviour exactly. main.js hands each unit its team's set via
+// view.fofW (falls back to these), so the two sides can run different weights in self-play.
+export const FOF_DEFAULT = {
+  hpPivot: 0.45, hpGain: 3,          // healthy → fight, low → flee
+  ammoHi: 1, ammoLow: -0.5, ammoDry: -4,   // dry guns can't win
+  shield: 1,                         // we have armour to spend
+  aggrPivot: 0.45, aggr: 2,          // brave brains press
+  defvPivot: 0.4, defv: 1.2,         // cautious brains hold back
+  fragile: 1.2,                      // firebrat dies in a hit or two
+  numbers: 1.5,                      // local headcount edge
+  crossfire: 3,                      // pinned by a turret AND a rival
+  enemyShield: 1,                    // they're harder to crack
+  counterUs: 1.6,                    // we counter them → press
+  counteredBy: 1.8,                  // they counter us → avoid
+  weaker: 1.5,                       // rival weaker / already running → finish it
+  escape: 1.6,                       // can't outrun them → stand and trade
+  facing: 1.0,                       // positional advantage (who has whose back)
+  jotunFloor: 1,                     // a Jotun with ammo always fights (can't run)
+};
+
+// FIGHT-OR-FLIGHT WEIGHT — should this unit pick a fight with the rival it sees, or keep
+// moving and avoid it? A signed score: > 0 = fight, <= 0 = don't engage. Coefficients come
+// from v.fofW (this team's weight set) or FOF_DEFAULT.
 function fightScore(v, p) {
-  const s = v.self;
-  let w = (s.hpFrac - 0.45) * 3;                                  // healthy → fight, low → flee
-  w += s.ammoFrac > 0.5 ? 1 : (s.ammoFrac <= 0 ? -4 : -0.5);      // dry guns can't win
-  if (s.shield > 0) w += 1;                                       // we have armour to spend
-  w += (p.aggression - 0.45) * 2;                                 // brave brains press
-  w -= (p.defensiveness - 0.4) * 1.2;                             // cautious brains hold back
-  if (s.type === 'firebrat') w -= 1.2;                            // fragile — dies in a hit or two
+  const s = v.self, W = v.fofW || FOF_DEFAULT;
+  let w = (s.hpFrac - W.hpPivot) * W.hpGain;
+  w += s.ammoFrac > 0.5 ? W.ammoHi : (s.ammoFrac <= 0 ? W.ammoDry : W.ammoLow);
+  if (s.shield > 0) w += W.shield;
+  w += (p.aggression - W.aggrPivot) * W.aggr;
+  w -= (p.defensiveness - W.defvPivot) * W.defv;
+  if (s.type === 'firebrat') w -= W.fragile;
   // NUMBERS: our local headcount (this unit + nearby friendlies) vs nearby rivals. Even
-  // odds is neutral; outnumbered tilts toward breaking off, having the numbers toward
-  // ganging up. Only weighed when rivals are actually close (a far sighting isn't a brawl).
-  if (v.enemiesNear > 0) w += (((v.alliesNear || 0) + 1) - v.enemiesNear) * 1.5;
-  // CROSSFIRE: pinned by a wall-turret AND a rival at once is a losing trade — don't stand
-  // and duel under tower fire (the hurt-latch then pulls it out as it takes damage).
-  if (v.threat && v.enemy) w -= 3;
+  // odds is neutral; outnumbered tilts toward breaking off, having the numbers toward ganging
+  // up. Only weighed when rivals are actually close (a far sighting isn't a brawl).
+  if (v.enemiesNear > 0) w += (((v.alliesNear || 0) + 1) - v.enemiesNear) * W.numbers;
+  // CROSSFIRE: pinned by a wall-turret AND a rival at once is a losing trade.
+  if (v.threat && v.enemy) w -= W.crossfire;
   if (v.enemy) {
-    if (v.enemy.shield > 0) w -= 1;                               // they're harder to crack
+    if (v.enemy.shield > 0) w -= W.enemyShield;
     const et = v.enemy.type;
-    if (et && COUNTER[et] === s.type) w += 1.6;                   // we counter them → press
-    if (et && COUNTER[s.type] === et) w -= 1.8;                   // they counter us → avoid
-    // ENEMY RELATIVE HP: a rival that's weaker than us (or already running) is worth
-    // finishing even when we're hurt — don't both limp away. (Subsumes the old finishHim.)
-    if (v.enemy.retreating || (v.enemy.hpFrac != null && v.enemy.hpFrac <= s.hpFrac)) w += 1.5;
-    // ESCAPE SURVIVABILITY: if we can't outrun what's on us — not a flyer, and slower than
-    // the rival — fleeing just gets us shot in the back, so stand and trade instead. This
-    // generalises the Jotun's "can't run, so doesn't" to ANY cornered unit (a hurt Lurcher
-    // chased by a Valkyrie shouldn't turn its back). Weighted so a decent matchup still fights.
-    if (!v.flyer && (SPEED[s.type] || 2) < (SPEED[et] || 2)) w += 1.6;
-    // FACING / POSITIONAL ADVANTAGE: who has whose back? A rival turned away has to swing
-    // around before it can shoot back, so we get free hits — press. If WE'RE the one caught
-    // facing away, they'll land the first shots — lean toward disengaging. (Front is local
-    // -Z, so forward = (-sin h, -cos h).) Symmetric: whoever's exposed reads a flee bias.
+    if (et && COUNTER[et] === s.type) w += W.counterUs;
+    if (et && COUNTER[s.type] === et) w -= W.counteredBy;
+    // ENEMY RELATIVE HP: a rival weaker than us (or already running) is worth finishing even
+    // when we're hurt — don't both limp away. (Subsumes the old finishHim.)
+    if (v.enemy.retreating || (v.enemy.hpFrac != null && v.enemy.hpFrac <= s.hpFrac)) w += W.weaker;
+    // ESCAPE SURVIVABILITY: can't outrun what's on us (not a flyer, slower than the rival) →
+    // fleeing gets us shot in the back, so stand and trade. Generalises the Jotun's can't-run.
+    if (!v.flyer && (SPEED[s.type] || 2) < (SPEED[et] || 2)) w += W.escape;
+    // FACING / POSITIONAL ADVANTAGE: who has whose back? A rival turned away must swing around
+    // before it can shoot back (free hits → press); if WE'RE caught facing away, they shoot
+    // first (disengage). Symmetric, so whoever's exposed reads a flee bias.
     if (v.enemy.heading != null) {
       const dx = v.enemy.x - s.x, dz = v.enemy.z - s.z, d = Math.hypot(dx, dz) || 1;
       const nx = dx / d, nz = dz / d;
       const iFace = (-Math.sin(s.heading)) * nx + (-Math.cos(s.heading)) * nz;               // +1 = we're pointed at them
       const theyFace = (-Math.sin(v.enemy.heading)) * (-nx) + (-Math.cos(v.enemy.heading)) * (-nz);  // +1 = they're pointed at us
-      if (iFace > 0.4 && theyFace < 0) w += 1.0;                  // we have their back → free damage, press
-      if (theyFace > 0.4 && iFace < 0) w -= 1.0;                  // they have ours → they shoot first, disengage
+      if (iFace > 0.4 && theyFace < 0) w += W.facing;            // we have their back → press
+      if (theyFace > 0.4 && iFace < 0) w -= W.facing;            // they have ours → disengage
     }
   }
-  // The Jotun can't run, so it doesn't: as long as it has ammo it stands, swings the
-  // railgun onto the target and fights regardless of the odds. (Out of ammo, it falls
-  // through to the normal score so the resupply latch can still pull it home.)
-  if (s.type === 'jotun' && s.ammoFrac > 0) return Math.max(w, 1);
+  // The Jotun can't run, so as long as it has ammo it stands and fights regardless of odds.
+  if (s.type === 'jotun' && s.ammoFrac > 0) return Math.max(w, W.jotunFloor);
   return w;
 }
 
