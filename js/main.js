@@ -2055,7 +2055,13 @@ function updatePlayerHud() {
 // can be AI — enabling AI-vs-AI and (with more bases) N independent sides. A
 // HUMAN team is run by the player drive/deploy code instead. Perception is
 // team-relative (a unit only knows rivals it actually sees), so nothing cheats.
-let AI_VISION = 66;   // how far an AI unit SEES an enemy (tunable via RR.setVision for A/B)
+let AI_VISION = 66;   // base sight range (tunable via RR.setVision)
+// Per-vehicle VISION: SIGHT = how far this type SEES; VIS = how far it's SEEN. Effective visual
+// detection of a target = AI_VISION × (SIGHT[observer] + VIS[target]) / 2. So the Valkyrie
+// (airborne) both sees and is seen from range; the Firebrat (small, hugs terrain) is spotted up
+// close; the Jotun is a big obvious target. Tunable via RR.setSight / RR.setVis.
+const SIGHT = { valkyrie: 1.5, lurcher: 1.0, firebrat: 1.0, jotun: 0.85 };
+const VIS   = { valkyrie: 1.5, jotun: 1.3, lurcher: 1.0, firebrat: 0.65 };
 // AI HEARING: how loud (same 0..1 audibility scale as the sound HUD) an unseen rival must
 // be before a unit investigates the noise. A heard contact only steers navigation — it is
 // NEVER a firing solution (enemy/seesEnemy stay line-of-sight). Gunfire easily clears this;
@@ -3197,7 +3203,8 @@ class AICommander {
     const px = v.holder.position.x, pz = v.holder.position.z, h = v.heading;
     const flyer = v._move.ignoreWalls;
     this.explore.mark(px, pz, AI_VISION * 0.7);   // paint this patch of map "known" for the team's recon memory
-    let seesEnemy = false, enemy = null, seen = null, best = AI_VISION * AI_VISION;
+    let seesEnemy = false, enemy = null, seen = null, nearestD = Infinity;
+    const mySight = SIGHT[v.type] ?? 1;
     // Local-brawl headcount for the fight-or-flight weight: how many rivals vs friendlies
     // are within striking distance of THIS unit (so it breaks off a losing gang-fight and
     // presses when it has the numbers). Counted by proximity (LOS-independent — being
@@ -3209,8 +3216,10 @@ class AICommander {
       const d = (o.holder.position.x - px) ** 2 + (o.holder.position.z - pz) ** 2;
       if (o.team === this.team) { if (o !== v && d < FIGHT_R2) alliesNear++; continue; }
       if (d < FIGHT_R2) enemiesNear++;
-      if (d < best && (flyer || hasLOS(px, pz, o.holder.position.x, o.holder.position.z))) {
-        best = d; enemy = { x: o.holder.position.x, y: o.holder.position.y, z: o.holder.position.z, type: o.type, shield: o.shield, vx: o._vx || 0, vz: o._vz || 0,
+      // Per-vehicle visual range: how far WE see + how far THEY show, averaged (see the SIGHT/VIS tables).
+      const effR = AI_VISION * (mySight + (VIS[o.type] ?? 1)) * 0.5;
+      if (d < effR * effR && d < nearestD && (flyer || hasLOS(px, pz, o.holder.position.x, o.holder.position.z))) {
+        nearestD = d; enemy = { x: o.holder.position.x, y: o.holder.position.y, z: o.holder.position.z, type: o.type, shield: o.shield, vx: o._vx || 0, vz: o._vz || 0,
           heading: o.heading, hpFrac: o.maxHp ? o.hp / o.maxHp : 1, retreating: o._aiState === 'retreat' || o._aiState === 'resupply' }; seen = o; seesEnemy = true;
       }
     }
@@ -4891,8 +4900,11 @@ window.RR = {
   get aiEvents() { return aiEvents.slice(); },                 // debug: the rolling AI decision log (headless can't read the DOM overlay)
   get combatEvents() { return combatEvents.slice(); },         // debug: vehicle-vs-vehicle hit feed
   planCount: () => _planCount,                                 // debug: cumulative A* planPath calls (needs ?perf to increment)
-  setVision: (v) => { AI_VISION = v; return AI_VISION; },      // AI unit sight range (A/B the "less distraction" idea)
+  setVision: (v) => { AI_VISION = v; return AI_VISION; },      // base sight range (A/B the "less distraction" idea)
   getVision: () => AI_VISION,
+  setSight: (type, m) => { SIGHT[type] = m; return { ...SIGHT }; },   // per-vehicle: how far this type SEES
+  setVis: (type, m) => { VIS[type] = m; return { ...VIS }; },         // per-vehicle: how far this type is SEEN
+  visionTables: () => ({ base: AI_VISION, SIGHT: { ...SIGHT }, VIS: { ...VIS } }),
   recStart: (mode) => recStart(mode),                          // FLIGHT RECORDER: capture per-unit decision changes (mode 'changes'|'all')
   recStop: () => recStop(),
   recDump: () => recDump(),                                    // → [{t,ty,reason,state,hp,am,fu,threat,threatLOS,enemyD,out,…}]
