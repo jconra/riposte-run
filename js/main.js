@@ -1120,14 +1120,14 @@ function updateShadows() {
       vehShadows.add(v._shadow);
     }
     const s = v._shadow;
-    if (v.dead) { s.visible = false; continue; }
+    if (v.dead || vehicleHidden(v)) { s.visible = false; continue; }   // no shadow while dead OR still rising up the lift shaft
     const x = v.holder.position.x, z = v.holder.position.z;
     const roadY = roadDeckY(x, z);                       // on a raised road slab? drape on its top, not the terrain below it
     const gy = roadY != null ? roadY : map.heightAt(x, z);
     const alt = Math.max(0, v.holder.position.y - gy);
     const f = 1 / (1 + alt * 0.14);   // 1 on the ground → fainter/smaller as it climbs
     s.visible = true;
-    s.position.set(x, gy + 0.07, z);
+    s.position.set(x, gy + 0.2, z);   // lifted so the flat decal doesn't cut into sloped shore terrain
     s.rotation.y = v.holder.rotation.y;
     if (v._shadowR) { const d = v._shadowR * 2 * (0.7 + 0.3 * f); s.scale.set(d, 1, d); }
     else s.scale.setScalar(0.7 + 0.3 * f);
@@ -2213,6 +2213,8 @@ function neutralSite(targetR) {
     const r = targetR * (0.78 + Math.random() * 0.44);
     const x = Math.cos(ang) * r, z = Math.sin(ang) * r;
     if (!map.isLand(x, z) || blockedAt(x, z)) continue;
+    const ci = Math.round(x / grid.cell), cj = Math.round(z / grid.cell);   // don't drop a supply on a road/bridge
+    if (roadNet.cells && roadNet.cells.has(ci + ',' + cj)) continue;
     let ok = true;
     for (const c of camps) if (Math.hypot(x - c.center.x, z - c.center.z) < 28) { ok = false; break; }
     if (ok) for (const rp of resupplies) if (Math.hypot(x - rp.pos.x, z - rp.pos.z) < 24) { ok = false; break; }
@@ -2239,6 +2241,8 @@ function bisectorSite(reach) {
     const off = baseOff * (1 - (t / 80) * 0.75) * (0.9 + Math.random() * 0.2);
     const x = mx + px * off * sign, z = mz + pz * off * sign;
     if (!map.isLand(x, z) || blockedAt(x, z)) continue;
+    const ci = Math.round(x / grid.cell), cj = Math.round(z / grid.cell);   // don't drop a supply on a road/bridge
+    if (roadNet.cells && roadNet.cells.has(ci + ',' + cj)) continue;
     let ok = true;
     for (const c of camps) if (Math.hypot(x - c.center.x, z - c.center.z) < 28) { ok = false; break; }
     if (ok) for (const rp of resupplies) if (Math.hypot(x - rp.pos.x, z - rp.pos.z) < 24) { ok = false; break; }
@@ -2253,7 +2257,7 @@ const RESUPPLY_HP = { fuel: 130, ammo: 150, shield: 110 };
 function addResupply(kind, site) {
   const g = RESUPPLY_MAKE[kind](grid.cell);
   const gy = map.heightAt(site.x, site.z);
-  g.position.set(site.x, gy, site.z);
+  g.position.set(site.x, gy + 0.06, site.z);   // tiny lift so the base doesn't z-fight the terrain
   scene.add(g);
   const rp = { kind, group: g, pos: new THREE.Vector3(site.x, gy, site.z), radius: grid.cell * 2.2, dead: false };
   applyStaging(g, kind);   // authored fallAt/dmgStyle (if any) before the Destructible reads them
@@ -2292,7 +2296,7 @@ function placeResupplies() {
     if (!site) continue;
     const g = sp.make(cell);
     const gy = map.heightAt(site.x, site.z);
-    g.position.set(site.x, gy, site.z);
+    g.position.set(site.x, gy + 0.06, site.z);   // tiny lift so the base doesn't z-fight the terrain
     scene.add(g);
     const rp = { kind: sp.kind, group: g, pos: new THREE.Vector3(site.x, gy, site.z), radius: cell * 2.2, dead: false };
     applyStaging(g, sp.kind);   // authored fallAt/dmgStyle (if any) before the Destructible reads them
